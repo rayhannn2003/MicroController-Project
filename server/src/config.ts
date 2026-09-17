@@ -54,9 +54,20 @@ const envSchema = z
       .string()
       .default('UTC')
       .refine(isValidTimezone, 'must be an IANA timezone such as Asia/Dhaka'),
+    DEVICE_TIMEOUT_S: z.coerce.number().int().min(5).max(600).default(30),
+    MAX_FRAME_BYTES: z.coerce.number().int().min(1024).max(2_000_000).default(200_000),
+    SLOW_VIEWER_BYTES: z.coerce.number().int().min(1024).max(10_000_000).default(200_000),
+    STREAM_TARGET_FPS: z.coerce.number().int().min(1).max(10).default(5),
+    STREAM_JPEG_QUALITY: z.coerce.number().int().min(10).max(100).default(65),
+    MAX_VIEWERS: z.coerce.number().int().min(1).max(1000).default(50),
+    WS_MAX_MESSAGE_BYTES: z.coerce.number().int().min(1024).max(4_000_000).default(262_144),
     LOG_LEVEL: z
       .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
       .default('info'),
+  })
+  .refine((env) => env.WS_MAX_MESSAGE_BYTES >= env.MAX_FRAME_BYTES, {
+    path: ['WS_MAX_MESSAGE_BYTES'],
+    message: 'must be at least MAX_FRAME_BYTES',
   })
   .transform((env) => ({
     nodeEnv: env.NODE_ENV,
@@ -73,6 +84,15 @@ const envSchema = z
       .filter(Boolean),
     displayTimezone: env.DISPLAY_TIMEZONE,
     logLevel: env.LOG_LEVEL,
+    realtime: {
+      deviceTimeoutMs: env.DEVICE_TIMEOUT_S * 1000,
+      maxFrameBytes: env.MAX_FRAME_BYTES,
+      slowViewerBytes: env.SLOW_VIEWER_BYTES,
+      targetFps: env.STREAM_TARGET_FPS,
+      jpegQuality: env.STREAM_JPEG_QUALITY,
+      maxViewers: env.MAX_VIEWERS,
+      maxMessageBytes: env.WS_MAX_MESSAGE_BYTES,
+    },
   }));
 
 export type Config = z.output<typeof envSchema>;

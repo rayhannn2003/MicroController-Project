@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { Link, Outlet, ScrollRestoration, useLocation } from 'react-router';
-import { useNewSampleWatcher } from '../../lib/live';
+import { useLiveUpdates } from '../../lib/live';
 import { useFilters } from '../../lib/useFilters';
 import { useOnline } from '../../lib/useOnline';
 import { IconLeaf, IconWifiOff } from '../ui/Icons';
@@ -42,7 +42,7 @@ function useRouteFocus() {
 function AppShell() {
   const { showToast } = useToasts();
   const { linkSearch } = useFilters();
-  const latest = useNewSampleWatcher((sample) => {
+  const latest = useLiveUpdates((sample) => {
     showToast({
       message: `New sample #${sample.id}`,
       link: { to: `/samples/${sample.id}${linkSearch}`, label: 'View' },

@@ -1,5 +1,6 @@
 import type {
   ApiError as ApiErrorBody,
+  DeviceStatus,
   ExportParams,
   NeighborsResponse,
   Sample,
@@ -84,6 +85,8 @@ export const api = {
 
   stats: (params: StatsParams, signal?: AbortSignal) =>
     request<StatsResponse>(`/api/stats${toQueryString({ ...params })}`, signal),
+
+  device: (signal?: AbortSignal) => request<DeviceStatus>('/api/device', signal),
 };
 
 export function exportCsvUrl(params: ExportParams): string {

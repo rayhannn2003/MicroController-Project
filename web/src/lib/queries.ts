@@ -1,7 +1,9 @@
-import type { SampleListParams, StatsParams } from '@sylvan/shared';
+import type { DeviceStatus, SampleListParams, StatsParams } from '@sylvan/shared';
 import { keepPreviousData, useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import { api } from './api';
 import { LIVE_POLL_INTERVAL_MS } from './constants';
+import { usePushedDeviceStatus } from './deviceStatusStore';
+import { useSocketOpen } from './socketContext';
 
 /**
  * Query keys. Everything that depends on the set of samples lives under `samples` or `stats`, so
@@ -17,13 +19,16 @@ export const queryKeys = {
   neighbors: (id: number) => [...queryKeys.samples(), 'neighbors', id] as const,
   stats: (params: StatsParams) => [...queryKeys.all, 'stats', params] as const,
   latest: () => [...queryKeys.all, 'latest'] as const,
+  device: () => [...queryKeys.all, 'device'] as const,
 };
 
 /**
- * Polling interval for live data. Phase 3 can return `false` here once a WebSocket connection
- * delivers `sample.created` events (which call `handleNewSample`).
+ * Polling interval for live data: paused while the WebSocket is open, because the server pushes
+ * `sample.created` and `device.status` instead. Everything falls back to polling when the socket
+ * is closed or blocked.
  */
-export const livePollInterval = () => LIVE_POLL_INTERVAL_MS;
+export const livePollInterval = (socketOpen: boolean): number | false =>
+  socketOpen ? false : LIVE_POLL_INTERVAL_MS;
 
 export function useSamples(params: SampleListParams, options: { enabled?: boolean } = {}) {
   return useQuery({
@@ -63,19 +68,39 @@ export function useNeighbors(id: number | null) {
 }
 
 export function useStats(params: StatsParams) {
+  const socketOpen = useSocketOpen();
   return useQuery({
     queryKey: queryKeys.stats(params),
     queryFn: ({ signal }) => api.stats(params, signal),
     placeholderData: keepPreviousData,
-    refetchInterval: livePollInterval,
+    refetchInterval: livePollInterval(socketOpen),
   });
 }
 
-/** The newest sample overall, polled so the app notices new uploads. */
+/**
+ * Rover status: pushed over the socket while it is open, polled from `GET /api/device` otherwise
+ * (so the page still works when WebSockets are blocked).
+ */
+export function useDeviceStatus(): { data: DeviceStatus | undefined; isPending: boolean } {
+  const socketOpen = useSocketOpen();
+  const pushed = usePushedDeviceStatus();
+  const query = useQuery<DeviceStatus>({
+    queryKey: queryKeys.device(),
+    queryFn: ({ signal }) => api.device(signal),
+    refetchInterval: livePollInterval(socketOpen),
+    enabled: !(socketOpen && pushed !== null),
+    staleTime: 5000,
+  });
+  const data = pushed ?? query.data;
+  return { data, isPending: data === undefined && query.isPending };
+}
+
+/** The newest sample overall, polled so the app notices new uploads without a socket. */
 export function useLatestSample() {
+  const socketOpen = useSocketOpen();
   return useQuery({
     queryKey: queryKeys.latest(),
     queryFn: async ({ signal }) => (await api.samples({ limit: 1 }, signal)).items[0] ?? null,
-    refetchInterval: livePollInterval,
+    refetchInterval: livePollInterval(socketOpen),
   });
 }

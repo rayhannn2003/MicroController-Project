@@ -2,11 +2,15 @@ import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
 import type { Config } from './config.js';
 import type { Sql } from './db/client.js';
 import { AppError, errorBody } from './lib/errors.js';
+import { createRealtime, type Realtime, type RealtimeConfig } from './realtime/index.js';
+import { deviceRoutes } from './routes/device.js';
 import { healthRoutes } from './routes/health.js';
 import { photoRoutes } from './routes/photos.js';
 import { exportRoutes } from './routes/export.js';
 import { sampleRoutes } from './routes/samples.js';
 import { statsRoutes } from './routes/stats.js';
+import { createDeviceEventStore } from './services/deviceEvents.js';
+import { createEventBus, type EventBus } from './services/events.js';
 import { createExportService } from './services/export.js';
 import { createPhotoStorage } from './services/photoStorage.js';
 import { createSamplesService } from './services/samples.js';
@@ -17,7 +21,17 @@ export type AppConfig = Pick<
   Config,
   'deviceKey' | 'photoDir' | 'maxPhotoBytes' | 'servePhotos' | 'trustProxy' | 'logLevel'
 > &
-  Partial<Pick<Config, 'displayTimezone' | 'publicBaseUrl'>>;
+  Partial<Pick<Config, 'displayTimezone' | 'publicBaseUrl'>> & {
+    /** Enables the WebSocket channels. Off unless set, so HTTP-only tests are unaffected. */
+    realtime?: RealtimeConfig;
+  };
+
+declare module 'fastify' {
+  interface FastifyInstance {
+    events: EventBus;
+    realtime: Realtime | null;
+  }
+}
 
 export interface BuildAppOptions {
   config: AppConfig;
@@ -65,6 +79,11 @@ export async function buildApp({
     requestIdHeader: false,
   });
 
+  const events = createEventBus((error) => {
+    app.log.error({ err: error }, 'event handler failed');
+  });
+  app.decorate('events', events);
+
   const storage = createPhotoStorage(config.photoDir);
   const samples = createSamplesService({
     sql,
@@ -108,15 +127,48 @@ export async function buildApp({
     return reply.code(404).send(errorBody('NOT_FOUND', 'Not found'));
   });
 
-  await app.register(healthRoutes, { sql });
+  let realtime: Realtime | null = null;
+  if (config.realtime) {
+    const deviceEvents = createDeviceEventStore({
+      sql,
+      onError: (error) => {
+        app.log.error({ err: error }, 'could not record device event');
+      },
+      onDropped: (type) => {
+        app.log.warn({ type }, 'device event rate limit reached; event not recorded');
+      },
+    });
+    realtime = createRealtime({
+      server: app.server,
+      config: config.realtime,
+      bus: events,
+      events: deviceEvents,
+      deviceKey: config.deviceKey,
+      log: app.log,
+    });
+    await realtime.init();
+    const active = realtime;
+    // Close sockets before the HTTP server stops, or open connections would hold it open.
+    app.addHook('preClose', async () => {
+      await active.close();
+    });
+    await app.register(deviceRoutes, { getStatus: () => active.status(), events: deviceEvents });
+  }
+  app.decorate('realtime', realtime);
+
+  const active = realtime;
+  await app.register(healthRoutes, {
+    sql,
+    ...(active ? { realtimeHealth: () => active.health() } : {}),
+  });
   await app.register(sampleRoutes, {
     samples,
+    events,
     deviceKey: config.deviceKey,
     maxPhotoBytes: config.maxPhotoBytes,
   });
   await app.register(statsRoutes, { stats });
   await app.register(exportRoutes, { exporter });
-  // Phase 3: register the realtime (WebSocket) plugin here.
   if (config.servePhotos) {
     await app.register(photoRoutes, { photoDir: storage.root });
   }

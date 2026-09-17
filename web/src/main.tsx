@@ -4,6 +4,7 @@ import { createRoot } from 'react-dom/client';
 import { RouterProvider } from 'react-router';
 import './index.css';
 import { createQueryClient } from './lib/queryClient';
+import { LiveSocketProvider } from './lib/socketContext';
 import { ThemeProvider } from './lib/theme';
 import { createRouter } from './router';
 
@@ -14,7 +15,9 @@ createRoot(root).render(
   <StrictMode>
     <ThemeProvider>
       <QueryClientProvider client={createQueryClient()}>
-        <RouterProvider router={createRouter()} />
+        <LiveSocketProvider>
+          <RouterProvider router={createRouter()} />
+        </LiveSocketProvider>
       </QueryClientProvider>
     </ThemeProvider>
   </StrictMode>,

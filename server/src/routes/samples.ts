@@ -9,10 +9,12 @@ import {
   type Readings,
 } from '../lib/validation.js';
 import { isJpeg } from '../services/photoStorage.js';
+import type { EventBus } from '../services/events.js';
 import type { SamplesService } from '../services/samples.js';
 
 interface SampleRoutesOptions {
   samples: SamplesService;
+  events: EventBus;
   deviceKey: string;
   maxPhotoBytes: number;
 }
@@ -30,7 +32,7 @@ declare module 'fastify' {
 
 /** `POST /api/samples`, the fixed contract used by the ESP32-CAM firmware. */
 const uploadRoute: FastifyPluginAsync<SampleRoutesOptions> = async (app, options) => {
-  const { samples, deviceKey, maxPhotoBytes } = options;
+  const { samples, events, deviceKey, maxPhotoBytes } = options;
 
   app.decorateRequest('sampleUpload', null);
 
@@ -110,6 +112,17 @@ const uploadRoute: FastifyPluginAsync<SampleRoutesOptions> = async (app, options
         { sampleId: result.response.id, created: result.created, photoBytes: photo?.length ?? 0 },
         result.created ? 'sample stored' : 'duplicate upload id resolved after race',
       );
+      if (result.created && events.hasSubscribers()) {
+        // The insert has committed; announce it without delaying the device's response.
+        void samples.get(String(result.response.id)).then(
+          (sample) => {
+            if (sample) events.publish({ type: 'sample.created', sample });
+          },
+          (error: unknown) => {
+            request.log.error({ err: error }, 'could not publish sample.created');
+          },
+        );
+      }
       return reply.code(result.created ? 201 : 200).send(result.response);
     },
   );

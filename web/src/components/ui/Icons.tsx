@@ -155,3 +155,25 @@ export const IconUpload = (p: IconProps) => (
     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" />
   </Icon>
 );
+export const IconLive = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M15 10a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+    <path d="M17.6 5.4a9 9 0 0 1 0 12.7M6.4 18.1a9 9 0 0 1 0-12.7M20.5 2.5a13 13 0 0 1 0 19M3.5 21.5a13 13 0 0 1 0-19" />
+  </Icon>
+);
+export const IconSignal = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M4 18v-3M9 18v-7M14 18v-11M19 18V4" />
+  </Icon>
+);
+export const IconPlugOff = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="m2 2 20 20M12 15v7M9 9v3a3 3 0 0 0 3 3h1M15 9V5M9 5v1M7 9h10" />
+  </Icon>
+);
+export const IconCamera = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M14.5 4h-5L8 6H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-4l-1.5-2Z" />
+    <circle cx="12" cy="13" r="3.5" />
+  </Icon>
+);

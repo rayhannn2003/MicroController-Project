@@ -13,6 +13,7 @@ export default defineConfig({
     proxy: {
       '/api': API_TARGET,
       '/photos': API_TARGET,
+      '/ws': { target: API_TARGET, ws: true },
     },
   },
   preview: {
@@ -21,6 +22,7 @@ export default defineConfig({
     proxy: {
       '/api': API_TARGET,
       '/photos': API_TARGET,
+      '/ws': { target: API_TARGET, ws: true },
     },
   },
   build: {

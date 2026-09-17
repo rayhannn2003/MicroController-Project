@@ -1,10 +1,11 @@
 import { NavLink } from 'react-router';
 import { useFilters } from '../../lib/useFilters';
-import { IconGallery, IconOverview, IconTable } from '../ui/Icons';
+import { IconGallery, IconLive, IconOverview, IconTable } from '../ui/Icons';
 
 export const NAV_ITEMS = [
   { to: '/', label: 'Overview', icon: IconOverview, end: true },
   { to: '/gallery', label: 'Gallery', icon: IconGallery, end: false },
+  { to: '/live', label: 'Live', icon: IconLive, end: false },
   { to: '/data', label: 'Data', icon: IconTable, end: false },
 ];
 
@@ -42,7 +43,7 @@ export function BottomNav() {
       aria-label="Main"
       className="fixed inset-x-0 bottom-0 z-40 border-t border-border bg-surface/95 pb-[env(safe-area-inset-bottom)] backdrop-blur md:hidden"
     >
-      <ul className="grid grid-cols-3">
+      <ul className="grid grid-cols-4">
         {NAV_ITEMS.map((item) => (
           <li key={item.to}>
             <NavLink

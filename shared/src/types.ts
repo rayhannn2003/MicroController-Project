@@ -124,6 +124,8 @@ export interface NeighborsResponse {
 export interface HealthResponse {
   status: 'ok';
   db: 'ok';
+  /** Present when the realtime (WebSocket) server is running. */
+  ws?: { viewers: number; deviceOnline: boolean };
 }
 
 export interface ApiError {
@@ -131,4 +133,118 @@ export interface ApiError {
     code: string;
     message: string;
   };
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Realtime (Phase 3)
+ * ---------------------------------------------------------------------------------------------- */
+
+/** Current rover status, from `GET /api/device` and the `/ws/live` channel. */
+export interface DeviceStatus {
+  /** Socket open and a heartbeat received within DEVICE_TIMEOUT_S. */
+  online: boolean;
+  /** Last heartbeat, frame or connection; survives server restarts. */
+  lastSeenAt: string | null;
+  connectedAt: string | null;
+  /** WiFi signal in dBm. */
+  rssi: number | null;
+  uptimeS: number | null;
+  freeHeap: number | null;
+  /** The device reports it is sending frames. */
+  streaming: boolean;
+  /** Viewers currently watching the live stream. */
+  viewers: number;
+  fw: string | null;
+}
+
+export type DeviceEventType = 'connected' | 'disconnected' | 'boot' | 'timeout';
+
+export interface DeviceEvent {
+  id: number;
+  createdAt: string;
+  type: DeviceEventType;
+  detail: {
+    rssi?: number;
+    uptimeS?: number;
+    fw?: string;
+    bootId?: string;
+    code?: number;
+    reason?: string;
+  } | null;
+}
+
+export interface DeviceEventsResponse {
+  items: DeviceEvent[];
+}
+
+/**
+ * WebSocket close codes used by `/ws/device` and `/ws/live` (values live in each workspace because
+ * this package is types only): 1001 server shutdown, 4002 replaced by a newer device connection,
+ * 4003 too many invalid messages, 4008 viewer too slow.
+ */
+export type CloseCode = 1001 | 4002 | 4003 | 4008;
+
+// Device → server
+export interface DeviceHelloMessage {
+  type: 'hello';
+  fw?: string;
+  bootId?: string;
+  ip?: string;
+}
+
+export interface DeviceHeartbeatMessage {
+  type: 'heartbeat';
+  rssi?: number;
+  uptimeS?: number;
+  freeHeap?: number;
+  streaming?: boolean;
+}
+
+/** Phase 4: reply to a `capture` command. */
+export interface DeviceCaptureResultMessage {
+  type: 'capture.result';
+  requestId: string;
+  ok: boolean;
+  sampleId?: number;
+  error?: string;
+}
+
+export type DeviceMessage =
+  DeviceHelloMessage | DeviceHeartbeatMessage | DeviceCaptureResultMessage;
+
+// Server → device
+export interface ServerViewersMessage {
+  type: 'viewers';
+  count: number;
+}
+
+export interface ServerConfigMessage {
+  type: 'config';
+  targetFps: number;
+  jpegQuality: number;
+}
+
+/** Phase 4: ask the device to take and upload a photo now (admin only). */
+export interface ServerCaptureMessage {
+  type: 'capture';
+  requestId: string;
+}
+
+export type ServerToDeviceMessage =
+  ServerViewersMessage | ServerConfigMessage | ServerCaptureMessage;
+
+// Server → viewer
+export type StreamState = 'starting' | 'live' | 'stopped';
+export type StreamStopReason = 'device_offline' | 'no_viewers' | 'viewer_left';
+
+export type ServerToViewerMessage =
+  | { type: 'hello'; serverTime: string; device: DeviceStatus }
+  | { type: 'device.status'; device: DeviceStatus }
+  | { type: 'sample.created'; sample: Sample }
+  | { type: 'stream.state'; state: StreamState; reason: StreamStopReason | null };
+
+// Viewer → server
+export interface ViewerWatchMessage {
+  type: 'watch';
+  on: boolean;
 }

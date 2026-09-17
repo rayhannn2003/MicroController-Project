@@ -19,7 +19,10 @@ describe('runMigrations', () => {
     expect(await runMigrations(sql)).toEqual([]);
     expect(await Promise.all([runMigrations(sql), runMigrations(sql)])).toEqual([[], []]);
     const versions = await sql<{ version: string }[]>`SELECT version FROM schema_migrations`;
-    expect(versions.map((row) => row.version)).toEqual(['001_create_samples.sql']);
+    expect(versions.map((row) => row.version)).toEqual([
+      '001_create_samples.sql',
+      '002_create_device_events.sql',
+    ]);
   });
 
   it('rolls back a failing migration and does not record it', async () => {

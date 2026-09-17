@@ -42,6 +42,7 @@ export const routes = [
     children: [
       { index: true, lazy: page(() => import('./pages/overview/OverviewPage')) },
       { path: 'gallery', lazy: page(() => import('./pages/GalleryPage')) },
+      { path: 'live', lazy: page(() => import('./pages/LivePage')) },
       { path: 'data', lazy: page(() => import('./pages/DataPage')) },
       { path: 'samples/:id', lazy: page(() => import('./pages/SampleDetailPage')) },
       { path: '*', lazy: page(() => import('./pages/NotFoundPage')) },

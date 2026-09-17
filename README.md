@@ -125,7 +125,7 @@ being built in five phases:
 1. **Backend foundation** (done): project structure, PostgreSQL, upload API, photo storage and
    local Docker setup
 2. **Dashboard** (done): stats and CSV endpoints, React frontend
-3. Realtime WebSockets: device heartbeat, live camera stream, instant updates
+3. **Realtime** (done): device heartbeat, live camera stream, instant updates
 4. Explore analytics, admin area, security hardening
 5. Production deployment on the VPS
 
@@ -158,6 +158,21 @@ being built in five phases:
   visible, and a toast announces new uploads.
 - Light and dark themes, mobile-first layout, WCAG 2.2 AA checks (axe) on every page, and a text
   summary plus table view for every chart.
+
+## What Phase 3 includes
+
+- **`WS /ws/device`**: one authenticated rover connection for heartbeats, live JPEG frames and
+  server commands (full contract below).
+- **`WS /ws/live`**: public, read-only viewer channel. It pushes device status, new samples and
+  live frames, and fans one device stream out to every watching viewer.
+- **True device status** on the dashboard (Online with signal strength, or Offline with the last
+  contact time), replacing the "last upload" guess. `GET /api/device` serves the same data over
+  plain HTTP for networks that block WebSockets.
+- **Instant sample updates**: uploads appear immediately instead of within 15 seconds. Polling
+  stays as the fallback and turns itself off while the socket is open.
+- **Live camera page** (`/live`) that only asks the rover to stream while someone is watching.
+- `device_events` table recording connect, disconnect, boot and heartbeat-timeout events, so
+  "last seen" survives a restart.
 
 ## Local setup
 
@@ -229,6 +244,12 @@ and `DATABASE_URL` are set by `docker-compose.yml`.
 | `SERVE_PHOTOS` | no | Serve `/photos/*` from Node; defaults to `true` only in development |
 | `TRUST_PROXY` | no | Comma-separated proxy addresses trusted for `X-Forwarded-*` (default `127.0.0.1,::1`) |
 | `DISPLAY_TIMEZONE` | no | IANA zone for stats and CSV when the client sends no `tz` (default `UTC`; `.env.example` uses `Asia/Dhaka`) |
+| `DEVICE_TIMEOUT_S` | no | Offline after this long without a heartbeat (default `30`) |
+| `MAX_FRAME_BYTES` | no | Largest accepted live frame (default `200000`) |
+| `SLOW_VIEWER_BYTES` | no | Skip frames for a viewer with this much unsent data (default `200000`) |
+| `STREAM_TARGET_FPS` / `STREAM_JPEG_QUALITY` | no | Sent to the rover in `config` (defaults `5` / `65`) |
+| `MAX_VIEWERS` | no | Simultaneous `/ws/live` connections (default `50`) |
+| `WS_MAX_MESSAGE_BYTES` | no | Hard per-message cap, must be ≥ `MAX_FRAME_BYTES` (default `262144`) |
 | `LOG_LEVEL` | no | Pino level, default `info` |
 
 The server checks all of these at startup and exits with a list of the variables that are wrong.
@@ -303,6 +324,8 @@ using the same `X-Upload-Id`. Do not retry `4xx`, because repeating the same req
 | `GET /api/samples/:id` | One `Sample`, or `404 {"error":{"code":"NOT_FOUND",...}}` |
 | `GET /api/samples/:id/neighbors` | `{"previousId": number \| null, "nextId": number \| null}` in time order, or `404` |
 | `GET /api/stats` | Aggregates for a range (see below) |
+| `GET /api/device` | Current `DeviceStatus` (also pushed over `/ws/live`) |
+| `GET /api/device/events?limit=` | Recent connect/disconnect/boot/timeout events (1–100, default 20) |
 | `GET /api/export.csv` | CSV download of samples (see below) |
 | `GET /photos/YYYY/MM/<uuid>.jpg` | Photo file (development only; nginx serves it in production) |
 
@@ -418,6 +441,87 @@ curl "$API/api/samples?status=ok&limit=10&cursor=<nextCursor>"
 `server/scripts/test-upload.sh [base-url]` runs these checks and fails if any response is wrong. It
 reads `DEVICE_KEY` from the environment or `.env` and never prints it.
 
+## WebSocket contract for the ESP32-CAM (`/ws/device`)
+
+This is the contract the firmware is written against. `server/scripts/fake-device.ts` is a working
+reference implementation:
+
+```bash
+npx tsx server/scripts/fake-device.ts --fps 5      # uses DEVICE_KEY from .env
+```
+
+### Connecting
+
+```text
+GET /ws/device HTTP/1.1
+Host: sylvan.example.com
+Upgrade: websocket
+X-Device-Key: <DEVICE_KEY>
+```
+
+- The key may instead be sent as `/ws/device?key=<DEVICE_KEY>`, which helps when debugging with a
+  tool that cannot set headers. **Prefer the header**: query strings show up in proxy and browser
+  logs. The server never logs either form.
+- A missing or wrong key is refused with **HTTP 401 before the upgrade**, so the device sees a
+  normal HTTP failure rather than a silent close. Unknown paths get 404.
+- Only one device is connected at a time. A new authenticated connection is accepted and the older
+  socket is closed with **4002 `replaced`**, so a rebooted rover is never locked out by its own
+  stale socket.
+- Use `wss://` in production. The rover should reconnect with exponential backoff (1 s up to 30 s,
+  with jitter) on any close or network error.
+
+### Device → server
+
+| Message | When | Notes |
+| --- | --- | --- |
+| `{"type":"hello","fw":"sylvan-esp32cam 1.0.0","bootId":"a1b2c3","ip":"192.168.0.105"}` | Once, right after connecting | All fields except `type` are optional. A `bootId` that differs from the last one recorded writes a `boot` event, so keep it stable until the next reset. |
+| `{"type":"heartbeat","rssi":-62,"uptimeS":1840,"freeHeap":142000,"streaming":true}` | Every 10 s | All fields optional. `rssi` −127..0, `uptimeS`/`freeHeap` ≥ 0. |
+| Binary frame | Only while `viewers > 0` | A complete JPEG starting with `FF D8`, at most `MAX_FRAME_BYTES` (200 KB). |
+| `{"type":"capture.result","requestId":"…","ok":true,"sampleId":42}` | Phase 4 | Accepted and logged; the matching `capture` command cannot be sent until the admin API exists. |
+
+Heartbeats must be more frequent than `DEVICE_TIMEOUT_S` (default 30 s); 10 s gives two chances to
+miss one. Anything from 5 s to 60 s works if `DEVICE_TIMEOUT_S` is at least twice the interval.
+
+### Server → device
+
+| Message | When |
+| --- | --- |
+| `{"type":"config","targetFps":5,"jpegQuality":65}` | On connect, from server configuration, so stream settings can change without reflashing |
+| `{"type":"viewers","count":2}` | On connect and whenever the count changes. Start streaming while `count > 0`, stop at `0`. |
+| `{"type":"capture","requestId":"…"}` | Phase 4 only (admin-triggered); never sent today |
+
+Viewer updates are debounced (about 250 ms before a start, 3 s before a stop, at most one message
+per second), so opening and closing the Live page quickly does not make the camera flap.
+
+### Keepalive, limits and close codes
+
+- The server sends a WebSocket **ping every 20 s** and terminates the connection after two
+  unanswered pings. Reply with a pong (most libraries do this automatically).
+- Invalid messages increase a counter: malformed JSON, a `hello`/`heartbeat` with out-of-range
+  fields, a binary frame that does not start with `FF D8`, or one larger than `MAX_FRAME_BYTES`.
+  **More than 10** closes the connection with **4003**. Unknown `type` values are ignored and do
+  not count.
+- Text messages are limited to 1 KB; any message above `WS_MAX_MESSAGE_BYTES` (256 KB) closes the
+  connection with the standard code 1009.
+- Frames arriving faster than ~10 fps are dropped by the server; frames sent while nobody is
+  watching are discarded.
+
+| Close code | Meaning | What the firmware should do |
+| --- | --- | --- |
+| `1001` | Server shutting down or restarting | Reconnect with backoff |
+| `1009` | Message larger than the hard limit | Lower the resolution or quality, then reconnect |
+| `4002` | Replaced by a newer device connection | Do not reconnect in a loop; this connection is stale |
+| `4003` | Too many invalid messages | Fix the payloads before reconnecting |
+
+### Viewer channel (`/ws/live`, public)
+
+Dashboards connect here; the rover does not. The server sends `hello`, `device.status`,
+`sample.created` and `stream.state` as JSON, plus JPEG frames as binary messages. A viewer sends
+`{"type":"watch","on":true}` to start receiving frames and `{"on":false}` to stop; only watching
+viewers count toward the rover's viewer count. Viewers that cannot keep up (more than
+`SLOW_VIEWER_BYTES` of unsent data for over 10 seconds) are closed with **4008** so one slow phone
+cannot slow the rover or the other viewers. Frames are never stored on disk or in the database.
+
 ## Platform folder structure
 
 ```text
@@ -434,39 +538,60 @@ server/
   src/app.ts              builds the Fastify app (logging, trust proxy, error shape, routes)
   src/config.ts           .env loading + Zod validation
   src/db/                 postgres client, migration runner, numbered SQL migrations
-  src/routes/             health, samples (upload, read, neighbors), stats, export, photos (dev)
-  src/services/           samples, stats, export (CSV stream), timezones, photoStorage
+  src/routes/             health, samples (upload, read, neighbors), stats, export, device, photos
+  src/realtime/           device channel, viewer channel, relay, status tracker, protocol
+  src/services/           samples, stats, export (CSV stream), timezones, photoStorage,
+                          events (in-process bus), deviceEvents (connect/boot/timeout log)
   src/lib/                auth (constant-time key check), validation, csv escaping, errors
-  scripts/                seed.ts, make-fixture.ts, test-upload.sh
+  scripts/                seed.ts, make-fixture.ts, fake-device.ts, test-upload.sh
   test/                   Vitest suites, test DB setup, fixtures/sample.jpg
 web/                      Phase 2: React dashboard (Vite)
   index.html              shell; applies the saved theme before first paint
   vite.config.ts          dev proxy for /api and /photos, build to web/dist, Vitest (jsdom)
   src/router.tsx          data router; one lazy chunk per page
   src/index.css           design tokens (colors, radii, spacing) for light and dark themes
-  src/lib/                api client, query hooks, live updates, URL filters, range presets,
-                          formatting, comparisons, chart gap splitting, constants, theme
+  src/lib/                api client, query hooks, live updates, WebSocket client, device status
+                          store, URL filters, range presets, formatting, comparisons, chart gap
+                          splitting, constants, theme
   src/components/layout/  app shell, top bar, bottom tabs, range sheet, toasts, theme toggle
   src/components/ui/      buttons, cards, badges, photo, readings, relative time, states
   src/components/Lightbox.tsx
-  src/pages/              overview/ (KPIs, charts), gallery, data, sample detail, not found
+  src/pages/              overview/ (KPIs, charts), gallery, data, live camera, sample detail,
+                          not found
   src/test/               unit and component tests
 deploy/                   Phase 5: nginx + production Compose (placeholder)
 data/photos/              photo storage (git-ignored)
 ```
 
 Later phases will add:
-- **Phase 3:** a WebSocket plugin registered in `app.ts` (marked with a comment). On the dashboard:
-  - Call `handleNewSample(queryClient, sample)` from `web/src/lib/live.ts` for each
-    `sample.created` event. It refreshes every sample and stats query, and the toast logic can
-    move there from `useNewSampleWatcher`.
-  - Return `false` from `livePollInterval()` in `web/src/lib/queries.ts` while the socket is
-    connected.
-  - Put the device online/offline badge in the slot marked in `LastUpload.tsx`.
+- **Phase 4:** admin routes and hardening (rate limits, security headers). The realtime side is
+  ready for it: `DeviceChannel.requestCapture(requestId)` sends the `capture` command and the
+  device replies with `capture.result`; wire both to an authenticated admin route. Once any
+  endpoint uses cookies, add an `Origin` check to the `/ws/live` upgrade, which is safe to skip
+  today because that channel is public and read-only.
 - **Phase 4:** admin routes and hardening (rate limits, security headers)
 - **Phase 5:** `deploy/` with the nginx site, which serves `data/photos` directly with
   `SERVE_PHOTOS=false`. Because the Docker port proxy makes requests appear to come from the
-  Compose network gateway, `TRUST_PROXY` must list that address.
+  Compose network gateway, `TRUST_PROXY` must list that address. WebSockets also need:
+
+  ```nginx
+  location /ws/ {
+      proxy_pass http://127.0.0.1:3100;
+      proxy_http_version 1.1;
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";   # required for the upgrade to pass through
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_read_timeout 300s;                 # longer than the 20 s ping interval
+      proxy_send_timeout 300s;
+      proxy_buffering off;                     # frames must not be buffered by nginx
+  }
+  ```
+
+  Without `proxy_buffering off`, nginx would absorb frames and hide slow viewers from the server's
+  backpressure checks. `proxy_read_timeout` must exceed the ping interval or nginx will drop idle
+  device connections.
 
 # sylvan
 # sylvan
