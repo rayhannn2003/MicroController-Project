@@ -124,7 +124,7 @@ being built in five phases:
 
 1. **Backend foundation** (done): project structure, PostgreSQL, upload API, photo storage and
    local Docker setup
-2. Dashboard frontend (React)
+2. **Dashboard** (done): stats and CSV endpoints, React frontend
 3. Realtime WebSockets: device heartbeat, live camera stream, instant updates
 4. Explore analytics, admin area, security hardening
 5. Production deployment on the VPS
@@ -141,6 +141,23 @@ being built in five phases:
   publishes no port, and both containers have memory limits.
 - Vitest suite (86 tests) against a real PostgreSQL test database, plus ESLint, Prettier and strict
   TypeScript
+
+## What Phase 2 includes
+
+- **API additions:** `GET /api/stats` (totals, min/avg/max, previous-period comparison, zero-filled
+  daily buckets in a timezone), `GET /api/samples/:id/neighbors`, a streamed `GET /api/export.csv`,
+  and `hasPhoto` / `order` filters on `GET /api/samples`. The ESP32 upload contract is unchanged.
+- **Dashboard (`web/`):** Vite + React 19 + TypeScript, React Router, TanStack Query, Tailwind CSS
+  v4 and Recharts (lazy-loaded). Pages:
+  - **Overview:** KPI cards with previous-period changes, latest sample, readings charts with
+    gap breaks, samples per day, recent samples
+  - **Gallery:** infinite scroll and an accessible lightbox with keyboard and swipe navigation
+  - **Data:** sortable table (cards on phones), jump to ID, CSV export
+  - **Sample detail:** comparison with the range average, previous/next navigation
+- Filters live in the URL. Stats and the newest sample are polled every 15 s while the tab is
+  visible, and a toast announces new uploads.
+- Light and dark themes, mobile-first layout, WCAG 2.2 AA checks (axe) on every page, and a text
+  summary plus table view for every chart.
 
 ## Local setup
 
@@ -185,8 +202,14 @@ PHOTO_DIR=./data/photos
 
 ```bash
 npm run db:up        # database only, with 127.0.0.1:5433 published
-npm run dev          # tsx watch on http://127.0.0.1:3100 (stop the app container first)
+npm run dev          # server (tsx watch, :3100) and dashboard (Vite, :5173) together
+npm run dev:server   # server only (stop the app container first)
+npm run dev:web      # dashboard only, proxying /api and /photos to the app on 127.0.0.1:3100
 ```
+
+To work on the dashboard alone, keep the Compose app container running and use `npm run dev:web`,
+then open http://127.0.0.1:5173. The dashboard only uses relative paths (`/api/...`, `/photos/...`),
+so the same build works behind nginx in production. `npm run build` writes it to `web/dist`.
 
 Real environment variables always win over both files. Inside Compose, `HOST`, `PORT`, `PHOTO_DIR`
 and `DATABASE_URL` are set by `docker-compose.yml`.
@@ -205,6 +228,7 @@ and `DATABASE_URL` are set by `docker-compose.yml`.
 | `PUBLIC_BASE_URL` | yes | Public http(s) origin of the site |
 | `SERVE_PHOTOS` | no | Serve `/photos/*` from Node; defaults to `true` only in development |
 | `TRUST_PROXY` | no | Comma-separated proxy addresses trusted for `X-Forwarded-*` (default `127.0.0.1,::1`) |
+| `DISPLAY_TIMEZONE` | no | IANA zone for stats and CSV when the client sends no `tz` (default `UTC`; `.env.example` uses `Asia/Dhaka`) |
 | `LOG_LEVEL` | no | Pino level, default `info` |
 
 The server checks all of these at startup and exits with a list of the variables that are wrong.
@@ -214,7 +238,8 @@ The list never includes their values.
 
 ```bash
 npm run db:up        # tests need the database on 127.0.0.1:5433
-npm test             # Vitest; recreates the sylvan_test database on every run
+npm test             # server tests (recreate sylvan_test) then dashboard tests (jsdom)
+npm run test:server  # or test:web for one workspace
 npm run typecheck
 npm run lint
 npm run format       # or format:check
@@ -276,6 +301,9 @@ using the same `X-Upload-Id`. Do not retry `4xx`, because repeating the same req
 | `GET /api/health` | `200 {"status":"ok","db":"ok"}`, or `503 {"error":{"code":"DATABASE_UNAVAILABLE",...}}` |
 | `GET /api/samples` | `{"items": Sample[], "nextCursor": string \| null}`, newest first |
 | `GET /api/samples/:id` | One `Sample`, or `404 {"error":{"code":"NOT_FOUND",...}}` |
+| `GET /api/samples/:id/neighbors` | `{"previousId": number \| null, "nextId": number \| null}` in time order, or `404` |
+| `GET /api/stats` | Aggregates for a range (see below) |
+| `GET /api/export.csv` | CSV download of samples (see below) |
 | `GET /photos/YYYY/MM/<uuid>.jpg` | Photo file (development only; nginx serves it in production) |
 
 `GET /api/samples` query parameters:
@@ -285,8 +313,11 @@ using the same `X-Upload-Id`. Do not retry `4xx`, because repeating the same req
 - `status`: `all` (default), `ok` or `failed`
 - `from`: ISO date or date-time, inclusive
 - `to`: ISO date (includes that whole UTC day) or date-time (inclusive)
+- `hasPhoto`: `true` or `false` (omit for both)
+- `order`: `desc` (newest first, default) or `asc`
 
-Invalid values return `400` with `INVALID_LIMIT`, `INVALID_CURSOR`, `INVALID_STATUS` or `INVALID_DATE`.
+Invalid values return `400` with `INVALID_LIMIT`, `INVALID_CURSOR`, `INVALID_STATUS`, `INVALID_DATE`,
+`INVALID_HAS_PHOTO` or `INVALID_ORDER`.
 
 ```json
 {
@@ -302,6 +333,59 @@ Invalid values return `400` with `INVALID_LIMIT`, `INVALID_CURSOR`, `INVALID_STA
 ```
 
 All errors use `{"error":{"code","message"}}`. Stack traces and SQL errors are never sent to clients.
+
+### `GET /api/stats?from&to&tz`
+
+`from` and `to` follow the same rules as `/api/samples`. `tz` is an IANA timezone used for daily
+buckets; it defaults to `DISPLAY_TIMEZONE`, and an unknown zone returns `400 INVALID_TIMEZONE`. All
+aggregation happens in SQL: one range scan for both periods, one daily query, and two indexed
+lookups.
+
+```json
+{
+  "range": { "from": "2026-09-10T18:00:00.000Z", "to": null, "tz": "Asia/Dhaka" },
+  "totals": { "samples": 34, "ok": 28, "failed": 6, "successRate": 0.8235, "withPhoto": 20 },
+  "metrics": {
+    "temperature": { "min": 20.5, "avg": 23.8, "max": 30, "count": 28 },
+    "humidity": { "min": 50.1, "avg": 63.3, "max": 71.3, "count": 28 },
+    "lux": { "min": 26, "avg": 2670, "max": 8405, "count": 28 }
+  },
+  "previousPeriod": {
+    "totals": { "samples": 30, "ok": 25, "failed": 5, "successRate": 0.8333 },
+    "metrics": { "temperature": { "avg": 22.9 }, "humidity": { "avg": 62.3 }, "lux": { "avg": 1776 } }
+  },
+  "latest": { "id": 64, "createdAt": "2026-09-17T17:00:47.970Z", "ok": false, "...": "..." },
+  "lastUploadAt": "2026-09-17T17:00:47.970Z",
+  "daily": [
+    { "date": "2026-09-11", "samples": 4, "ok": 2, "failed": 2, "avgTemperature": 23.3, "avgHumidity": 56.3, "avgLux": 4614 }
+  ],
+  "dailyTruncated": false
+}
+```
+
+- `successRate` is a fraction from 0 to 1, or `null` when there are no samples.
+- Temperature and humidity averages have one decimal; the lux average is a whole number.
+- `previousPeriod` is the same length immediately before `from`, or `null` without `from`.
+- `latest` is the newest sample in range; `lastUploadAt` is the newest sample overall.
+- `daily` includes days with no samples. Without `from`, it starts at the first sample in range.
+  Ranges longer than 366 days return the most recent 366 with `dailyTruncated: true`.
+
+### `GET /api/export.csv?status&from&to&tz`
+
+Downloads `sylvan-samples-YYYY-MM-DD.csv` as UTF-8 with a BOM, so Excel opens it correctly:
+
+```text
+id,created_at_utc,created_at_local,status,temperature_c,humidity_pct,light_lux,photo_url
+63,2026-09-17T17:00:47Z,2026-09-17 23:00:47,ok,30.0,66.0,235,http://localhost:3100/photos/2026/09/b7e7….jpg
+62,2026-09-17T16:59:15Z,2026-09-17 22:59:15,failed,,,,
+```
+
+- Rows are newest first and streamed in batches of 1,000, so the file is never built in memory and
+  no database connection is held for the whole download.
+- The export stops at 50,000 rows and ends with a `# Export truncated…` line.
+- Cells are quoted per RFC 4180. Values starting with `=`, `+`, `-`, `@`, tab or carriage return get
+  a `'` prefix against formula injection, except plain negative numbers in numeric columns.
+- Photo URLs are absolute, using `PUBLIC_BASE_URL`.
 
 ## curl examples
 
@@ -337,7 +421,7 @@ reads `DEVICE_KEY` from the environment or `.env` and never prints it.
 ## Platform folder structure
 
 ```text
-package.json              npm workspaces root (shared, server) and scripts
+package.json              npm workspaces root (shared, server, web) and scripts
 tsconfig.base.json        strict compiler settings shared by all packages
 eslint.config.js          ESLint (typescript-eslint strict, type-checked) + Prettier
 .env.example              configuration template (.env and .env.local are git-ignored)
@@ -350,19 +434,35 @@ server/
   src/app.ts              builds the Fastify app (logging, trust proxy, error shape, routes)
   src/config.ts           .env loading + Zod validation
   src/db/                 postgres client, migration runner, numbered SQL migrations
-  src/routes/             health, samples (upload + read), photos (development only)
-  src/services/           samples (business logic, idempotency), photoStorage (atomic files)
-  src/lib/                auth (constant-time key check), validation, errors
+  src/routes/             health, samples (upload, read, neighbors), stats, export, photos (dev)
+  src/services/           samples, stats, export (CSV stream), timezones, photoStorage
+  src/lib/                auth (constant-time key check), validation, csv escaping, errors
   scripts/                seed.ts, make-fixture.ts, test-upload.sh
   test/                   Vitest suites, test DB setup, fixtures/sample.jpg
-web/                      Phase 2: React dashboard (placeholder)
+web/                      Phase 2: React dashboard (Vite)
+  index.html              shell; applies the saved theme before first paint
+  vite.config.ts          dev proxy for /api and /photos, build to web/dist, Vitest (jsdom)
+  src/router.tsx          data router; one lazy chunk per page
+  src/index.css           design tokens (colors, radii, spacing) for light and dark themes
+  src/lib/                api client, query hooks, live updates, URL filters, range presets,
+                          formatting, comparisons, chart gap splitting, constants, theme
+  src/components/layout/  app shell, top bar, bottom tabs, range sheet, toasts, theme toggle
+  src/components/ui/      buttons, cards, badges, photo, readings, relative time, states
+  src/components/Lightbox.tsx
+  src/pages/              overview/ (KPIs, charts), gallery, data, sample detail, not found
+  src/test/               unit and component tests
 deploy/                   Phase 5: nginx + production Compose (placeholder)
 data/photos/              photo storage (git-ignored)
 ```
 
 Later phases will add:
-- **Phase 2:** `web/` as a workspace importing `@sylvan/shared`
-- **Phase 3:** a WebSocket plugin registered in `app.ts` next to the existing routes
+- **Phase 3:** a WebSocket plugin registered in `app.ts` (marked with a comment). On the dashboard:
+  - Call `handleNewSample(queryClient, sample)` from `web/src/lib/live.ts` for each
+    `sample.created` event. It refreshes every sample and stats query, and the toast logic can
+    move there from `useNewSampleWatcher`.
+  - Return `false` from `livePollInterval()` in `web/src/lib/queries.ts` while the socket is
+    connected.
+  - Put the device online/offline badge in the slot marked in `LastUpload.tsx`.
 - **Phase 4:** admin routes and hardening (rate limits, security headers)
 - **Phase 5:** `deploy/` with the nginx site, which serves `data/photos` directly with
   `SERVE_PHOTOS=false`. Because the Docker port proxy makes requests appear to come from the

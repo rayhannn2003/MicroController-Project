@@ -1,5 +1,6 @@
 import js from '@eslint/js';
 import prettier from 'eslint-config-prettier';
+import reactHooks from 'eslint-plugin-react-hooks';
 import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
@@ -23,7 +24,7 @@ export default tseslint.config(
     languageOptions: {
       globals: globals.node,
       parserOptions: {
-        project: ['./shared/tsconfig.json', './server/tsconfig.check.json'],
+        project: ['./shared/tsconfig.json', './server/tsconfig.check.json', './web/tsconfig.json'],
         tsconfigRootDir: import.meta.dirname,
       },
     },
@@ -35,6 +36,14 @@ export default tseslint.config(
       ],
       // Fastify uses `async` to select promise-style plugins and hooks, even without an await.
       '@typescript-eslint/require-await': 'off',
+    },
+  },
+  {
+    files: ['web/**/*.{ts,tsx}'],
+    plugins: { 'react-hooks': reactHooks },
+    languageOptions: { globals: globals.browser },
+    rules: {
+      ...reactHooks.configs.recommended.rules,
     },
   },
   {

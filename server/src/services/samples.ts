@@ -1,9 +1,15 @@
-import type { Sample, SampleListResponse, UploadResponse } from '@sylvan/shared';
+import type {
+  NeighborsResponse,
+  Sample,
+  SampleListResponse,
+  SampleStatusFilter,
+  UploadResponse,
+} from '@sylvan/shared';
 import type { Sql } from '../db/client.js';
-import { encodeCursor, type ListQuery, type Readings } from '../lib/validation.js';
+import { encodeCursor, type DateRange, type ListQuery, type Readings } from '../lib/validation.js';
 import type { PhotoStorage, StoredPhoto } from './photoStorage.js';
 
-interface SampleRow {
+export interface SampleRow {
   id: string;
   created_at: Date;
   cursor_ts: string;
@@ -32,11 +38,12 @@ export interface SamplesService {
   create(input: CreateSampleInput): Promise<CreateSampleResult>;
   list(query: ListQuery): Promise<SampleListResponse>;
   get(id: string): Promise<Sample | null>;
+  neighbors(id: string): Promise<NeighborsResponse | null>;
 }
 
 const toNumber = (value: string | null) => (value === null ? null : Number(value));
 
-function toSample(row: SampleRow): Sample {
+export function toSample(row: SampleRow): Sample {
   return {
     id: Number(row.id),
     createdAt: row.created_at.toISOString(),
@@ -49,6 +56,23 @@ function toSample(row: SampleRow): Sample {
   };
 }
 
+/** SQL conditions (each starting with AND) for the shared status and date filters. */
+export function sampleFilters(
+  sql: Sql,
+  { status = 'all', from, to }: DateRange & { status?: SampleStatusFilter },
+) {
+  return sql`
+    ${status === 'ok' ? sql`AND ok` : status === 'failed' ? sql`AND NOT ok` : sql``}
+    ${from ? sql`AND created_at >= ${from}` : sql``}
+    ${to ? (to.exclusive ? sql`AND created_at < ${to.date}` : sql`AND created_at <= ${to.date}`) : sql``}
+  `;
+}
+
+export const sampleColumns = (sql: Sql) => sql`
+  id, created_at, ok, temperature, humidity, lux, photo_key, photo_bytes,
+  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_ts
+`;
+
 export function createSamplesService(deps: {
   sql: Sql;
   storage: PhotoStorage;
@@ -56,10 +80,7 @@ export function createSamplesService(deps: {
 }): SamplesService {
   const { sql, storage } = deps;
 
-  const selectColumns = () => sql`
-    id, created_at, ok, temperature, humidity, lux, photo_key, photo_bytes,
-    to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_ts
-  `;
+  const selectColumns = () => sampleColumns(sql);
 
   async function findUpload(uploadId: string): Promise<UploadResponse | null> {
     const [row] = await sql<{ id: string; photo_key: string | null }[]>`
@@ -112,16 +133,20 @@ export function createSamplesService(deps: {
       return { created: false, response: existing };
     },
 
-    async list({ limit, cursor, status, from, to }) {
+    async list({ limit, cursor, hasPhoto, order, ...filters }) {
+      const after = cursor
+        ? order === 'asc'
+          ? sql`AND (created_at, id) > (${cursor.createdAt}::timestamptz, ${cursor.id}::bigint)`
+          : sql`AND (created_at, id) < (${cursor.createdAt}::timestamptz, ${cursor.id}::bigint)`
+        : sql``;
       const rows = await sql<SampleRow[]>`
         SELECT ${selectColumns()}
         FROM samples
         WHERE TRUE
-          ${status === 'ok' ? sql`AND ok` : status === 'failed' ? sql`AND NOT ok` : sql``}
-          ${from ? sql`AND created_at >= ${from}` : sql``}
-          ${to ? (to.exclusive ? sql`AND created_at < ${to.date}` : sql`AND created_at <= ${to.date}`) : sql``}
-          ${cursor ? sql`AND (created_at, id) < (${cursor.createdAt}::timestamptz, ${cursor.id}::bigint)` : sql``}
-        ORDER BY created_at DESC, id DESC
+          ${sampleFilters(sql, filters)}
+          ${hasPhoto === null ? sql`` : hasPhoto ? sql`AND photo_key IS NOT NULL` : sql`AND photo_key IS NULL`}
+          ${after}
+        ORDER BY ${order === 'asc' ? sql`created_at ASC, id ASC` : sql`created_at DESC, id DESC`}
         LIMIT ${limit + 1}
       `;
 
@@ -141,6 +166,25 @@ export function createSamplesService(deps: {
         SampleRow[]
       >`SELECT ${selectColumns()} FROM samples WHERE id = ${id}::bigint`;
       return row ? toSample(row) : null;
+    },
+
+    async neighbors(id) {
+      const [row] = await sql<{ previous_id: string | null; next_id: string | null }[]>`
+        SELECT
+          (SELECT p.id FROM samples p
+            WHERE (p.created_at, p.id) < (c.created_at, c.id)
+            ORDER BY p.created_at DESC, p.id DESC LIMIT 1) AS previous_id,
+          (SELECT n.id FROM samples n
+            WHERE (n.created_at, n.id) > (c.created_at, c.id)
+            ORDER BY n.created_at ASC, n.id ASC LIMIT 1) AS next_id
+        FROM samples c
+        WHERE c.id = ${id}::bigint
+      `;
+      if (!row) return null;
+      return {
+        previousId: row.previous_id === null ? null : Number(row.previous_id),
+        nextId: row.next_id === null ? null : Number(row.next_id),
+      };
     },
   };
 }

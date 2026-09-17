@@ -126,6 +126,13 @@ const readRoutes: FastifyPluginAsync<{ samples: SamplesService }> = async (app, 
     if (!sample) return reply.code(404).send(errorBody('NOT_FOUND', 'Sample not found'));
     return sample;
   });
+
+  app.get<{ Params: { id: string } }>('/api/samples/:id/neighbors', async (request, reply) => {
+    const id = parseSampleId(request.params.id);
+    const neighbors = id === null ? null : await samples.neighbors(id);
+    if (!neighbors) return reply.code(404).send(errorBody('NOT_FOUND', 'Sample not found'));
+    return neighbors;
+  });
 };
 
 export const sampleRoutes: FastifyPluginAsync<SampleRoutesOptions> = async (app, options) => {

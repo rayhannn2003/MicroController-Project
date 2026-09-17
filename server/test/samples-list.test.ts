@@ -145,7 +145,26 @@ describe('GET /api/samples', () => {
     expect(combined).toHaveLength(3);
   });
 
+  it('filters by photo presence', async () => {
+    await insert('2026-09-10T08:00:00Z', true, 2);
+    await ctx.sql`UPDATE samples SET photo_key = '2026/09/x.jpg', photo_bytes = 10 WHERE id = 1`;
+
+    expect((await list('?hasPhoto=true')).items.map((item) => item.id)).toEqual([1]);
+    expect((await list('?hasPhoto=false')).items.map((item) => item.id)).toEqual([2]);
+    expect((await list()).items).toHaveLength(2);
+  });
+
+  it('pages oldest first with order=asc', async () => {
+    await insert('2026-09-10T08:00:00Z', true, 4);
+    await insert('2026-09-09T08:00:00Z', false, 3);
+
+    const items = await listAll('?order=asc&limit=2');
+    expect(items.map((item) => item.id)).toEqual([5, 6, 7, 1, 2, 3, 4]);
+  });
+
   it.each([
+    ['?hasPhoto=yes', 'INVALID_HAS_PHOTO'],
+    ['?order=newest', 'INVALID_ORDER'],
     ['?status=broken', 'INVALID_STATUS'],
     ['?limit=0', 'INVALID_LIMIT'],
     ['?limit=abc', 'INVALID_LIMIT'],

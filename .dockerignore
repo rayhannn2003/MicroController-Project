@@ -11,7 +11,8 @@ blink
 backup_code
 Sylvan
 .kilo
-web
+web/*
+!web/package.json
 deploy
 server/test
 server/scripts

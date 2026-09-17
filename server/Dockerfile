@@ -5,16 +5,18 @@ WORKDIR /app
 COPY package.json package-lock.json tsconfig.base.json ./
 COPY shared/package.json shared/
 COPY server/package.json server/
+COPY web/package.json web/
 RUN npm ci --workspace shared --workspace server --include-workspace-root --ignore-scripts
 COPY shared/ shared/
 COPY server/ server/
-RUN npm run build
+RUN npm run build -w shared && npm run build -w server
 
 FROM node:22-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 COPY shared/package.json shared/
 COPY server/package.json server/
+COPY web/package.json web/
 RUN npm ci --workspace server --omit=dev --ignore-scripts && npm cache clean --force
 
 FROM node:22-alpine

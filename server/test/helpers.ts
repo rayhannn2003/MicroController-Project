@@ -44,6 +44,8 @@ export async function createTestContext(overrides: Partial<AppConfig> = {}): Pro
       servePhotos: true,
       trustProxy: ['127.0.0.1'],
       logLevel: 'info',
+      displayTimezone: 'Asia/Dhaka',
+      publicBaseUrl: 'https://sylvan.example.com',
       ...overrides,
     },
   });
@@ -83,4 +85,31 @@ export async function listFiles(dir: string): Promise<string[]> {
 
 export function uploadHeaders(extra: Record<string, string> = {}) {
   return { 'x-device-key': DEVICE_KEY, ...extra };
+}
+
+export interface InsertSample {
+  createdAt: string;
+  ok?: boolean;
+  temperature?: number;
+  humidity?: number;
+  lux?: number;
+  photoKey?: string | null;
+}
+
+/** Inserts a sample directly, bypassing the upload API, and returns its id. */
+export async function insertSample(sql: Sql, sample: InsertSample): Promise<number> {
+  const ok = sample.ok ?? true;
+  const [row] = await sql<{ id: string }[]>`
+    INSERT INTO samples (created_at, ok, temperature, humidity, lux, photo_key, photo_bytes)
+    VALUES (
+      ${sample.createdAt}::timestamptz, ${ok},
+      ${ok ? (sample.temperature ?? 24) : null},
+      ${ok ? (sample.humidity ?? 60) : null},
+      ${ok ? (sample.lux ?? 500) : null},
+      ${sample.photoKey ?? null},
+      ${sample.photoKey ? 1000 : null}
+    )
+    RETURNING id
+  `;
+  return Number(row?.id);
 }

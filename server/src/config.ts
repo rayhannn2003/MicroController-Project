@@ -17,6 +17,15 @@ export function loadEnvFiles(root = REPO_ROOT): void {
   }
 }
 
+function isValidTimezone(name: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en', { timeZone: name });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const booleanString = z
   .enum(['true', 'false', '1', '0'], { error: 'must be true or false' })
   .transform((value) => value === 'true' || value === '1');
@@ -41,6 +50,10 @@ const envSchema = z
     PUBLIC_BASE_URL: z.url({ protocol: /^https?$/, error: 'must be an http(s) URL' }),
     SERVE_PHOTOS: booleanString.optional(),
     TRUST_PROXY: z.string().default('127.0.0.1,::1'),
+    DISPLAY_TIMEZONE: z
+      .string()
+      .default('UTC')
+      .refine(isValidTimezone, 'must be an IANA timezone such as Asia/Dhaka'),
     LOG_LEVEL: z
       .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
       .default('info'),
@@ -58,6 +71,7 @@ const envSchema = z
     trustProxy: env.TRUST_PROXY.split(',')
       .map((entry) => entry.trim())
       .filter(Boolean),
+    displayTimezone: env.DISPLAY_TIMEZONE,
     logLevel: env.LOG_LEVEL,
   }));
 

@@ -44,7 +44,12 @@ async function main() {
 
   await app.listen({ port: config.port, host: config.host });
   app.log.info(
-    { publicBaseUrl: config.publicBaseUrl, servePhotos: config.servePhotos, env: config.nodeEnv },
+    {
+      publicBaseUrl: config.publicBaseUrl,
+      servePhotos: config.servePhotos,
+      displayTimezone: config.displayTimezone,
+      env: config.nodeEnv,
+    },
     'sylvan server ready',
   );
 }

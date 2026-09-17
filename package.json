@@ -6,19 +6,24 @@
   "description": "Project Sylvan web platform",
   "workspaces": [
     "shared",
-    "server"
+    "server",
+    "web"
   ],
   "engines": {
     "node": ">=22.13"
   },
   "scripts": {
-    "dev": "npm run build -w shared && npm run dev -w server",
-    "build": "npm run build -w shared && npm run build -w server",
-    "typecheck": "npm run build -w shared && npm run typecheck -w server",
+    "dev": "npm run build -w shared && concurrently -k -n server,web -c green,cyan \"npm run dev -w server\" \"npm run dev -w web\"",
+    "dev:server": "npm run build -w shared && npm run dev -w server",
+    "dev:web": "npm run build -w shared && npm run dev -w web",
+    "build": "npm run build -w shared && npm run build -w server && npm run build -w web",
+    "typecheck": "npm run build -w shared && npm run typecheck -w server && npm run typecheck -w web",
     "db:up": "docker compose -f docker-compose.yml -f docker-compose.db-port.yml up -d db",
     "db:migrate": "npm run db:migrate -w server",
     "db:seed": "npm run db:seed -w server",
-    "test": "npm run build -w shared && npm test -w server",
+    "test": "npm run build -w shared && npm test -w server && npm test -w web",
+    "test:server": "npm run build -w shared && npm test -w server",
+    "test:web": "npm run build -w shared && npm test -w web",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
@@ -26,8 +31,10 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/node": "^22.20.3",
+    "concurrently": "^10.0.5",
     "eslint": "^10.10.0",
     "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-react-hooks": "^7.1.1",
     "globals": "^17.12.0",
     "jpeg-js": "^0.4.4",
     "prettier": "^3.9.7",

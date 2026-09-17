@@ -4,14 +4,20 @@ import type { Sql } from './db/client.js';
 import { AppError, errorBody } from './lib/errors.js';
 import { healthRoutes } from './routes/health.js';
 import { photoRoutes } from './routes/photos.js';
+import { exportRoutes } from './routes/export.js';
 import { sampleRoutes } from './routes/samples.js';
+import { statsRoutes } from './routes/stats.js';
+import { createExportService } from './services/export.js';
 import { createPhotoStorage } from './services/photoStorage.js';
 import { createSamplesService } from './services/samples.js';
+import { createStatsService } from './services/stats.js';
+import { createTimezoneResolver } from './services/timezones.js';
 
 export type AppConfig = Pick<
   Config,
   'deviceKey' | 'photoDir' | 'maxPhotoBytes' | 'servePhotos' | 'trustProxy' | 'logLevel'
->;
+> &
+  Partial<Pick<Config, 'displayTimezone' | 'publicBaseUrl'>>;
 
 export interface BuildAppOptions {
   config: AppConfig;
@@ -68,6 +74,14 @@ export async function buildApp({
     },
   });
 
+  const timezones = createTimezoneResolver(sql, config.displayTimezone ?? 'UTC');
+  const stats = createStatsService({ sql, samples, timezones });
+  const exporter = createExportService({
+    sql,
+    timezones,
+    publicBaseUrl: config.publicBaseUrl ?? '',
+  });
+
   app.setErrorHandler((error: FastifyError | AppError, request, reply) => {
     if (error instanceof AppError) {
       if (error.statusCode >= 500) request.log.error({ err: error }, error.message);
@@ -100,6 +114,9 @@ export async function buildApp({
     deviceKey: config.deviceKey,
     maxPhotoBytes: config.maxPhotoBytes,
   });
+  await app.register(statsRoutes, { stats });
+  await app.register(exportRoutes, { exporter });
+  // Phase 3: register the realtime (WebSocket) plugin here.
   if (config.servePhotos) {
     await app.register(photoRoutes, { photoDir: storage.root });
   }

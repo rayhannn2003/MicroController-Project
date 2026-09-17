@@ -29,6 +29,98 @@ export interface UploadResponse {
 
 export type SampleStatusFilter = 'all' | 'ok' | 'failed';
 
+export type SampleOrder = 'desc' | 'asc';
+
+/** Query parameters accepted by `GET /api/samples`. Dates are ISO 8601 strings. */
+export interface SampleListParams {
+  limit?: number;
+  cursor?: string;
+  status?: SampleStatusFilter;
+  from?: string;
+  to?: string;
+  /** Only samples with (`true`) or without (`false`) a photo. */
+  hasPhoto?: boolean;
+  /** `desc` (newest first, default) or `asc` (oldest first). */
+  order?: SampleOrder;
+}
+
+/** Query parameters accepted by `GET /api/stats`. */
+export interface StatsParams {
+  from?: string;
+  to?: string;
+  /** IANA timezone used for daily buckets; defaults to the server's DISPLAY_TIMEZONE. */
+  tz?: string;
+}
+
+/** Query parameters accepted by `GET /api/export.csv`. */
+export interface ExportParams {
+  status?: SampleStatusFilter;
+  from?: string;
+  to?: string;
+  tz?: string;
+}
+
+export interface MetricSummary {
+  min: number | null;
+  avg: number | null;
+  max: number | null;
+  /** Number of samples that have this reading (successful samples). */
+  count: number;
+}
+
+export interface PeriodTotals {
+  samples: number;
+  ok: number;
+  failed: number;
+  /** `ok / samples` as a fraction from 0 to 1; null when there are no samples. */
+  successRate: number | null;
+}
+
+export interface DailyStats {
+  /** Calendar day `YYYY-MM-DD` in the requested timezone. */
+  date: string;
+  samples: number;
+  ok: number;
+  failed: number;
+  avgTemperature: number | null;
+  avgHumidity: number | null;
+  avgLux: number | null;
+}
+
+export interface StatsResponse {
+  range: { from: string | null; to: string | null; tz: string };
+  totals: PeriodTotals & { withPhoto: number };
+  metrics: {
+    temperature: MetricSummary;
+    humidity: MetricSummary;
+    lux: MetricSummary;
+  };
+  /** The same-length period immediately before `from`; null when `from` is not set. */
+  previousPeriod: {
+    totals: PeriodTotals;
+    metrics: {
+      temperature: { avg: number | null };
+      humidity: { avg: number | null };
+      lux: { avg: number | null };
+    };
+  } | null;
+  /** Newest sample inside the range. */
+  latest: Sample | null;
+  /** Newest sample overall, regardless of range. */
+  lastUploadAt: string | null;
+  /** One entry per day in the range, including days without samples (at most 366). */
+  daily: DailyStats[];
+  /** True when the range spans more than 366 days and only the most recent 366 are returned. */
+  dailyTruncated: boolean;
+}
+
+export interface NeighborsResponse {
+  /** The sample immediately before this one in time order. */
+  previousId: number | null;
+  /** The sample immediately after this one in time order. */
+  nextId: number | null;
+}
+
 export interface HealthResponse {
   status: 'ok';
   db: 'ok';

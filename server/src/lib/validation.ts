@@ -1,4 +1,4 @@
-import type { SampleStatusFilter } from '@sylvan/shared';
+import type { SampleOrder, SampleStatusFilter } from '@sylvan/shared';
 import { AppError } from './errors.js';
 
 export interface Readings {
@@ -126,13 +126,37 @@ function readDate(query: Query, key: 'from' | 'to'): Date | null {
   return date;
 }
 
-export interface ListQuery {
-  limit: number;
-  cursor: Cursor | null;
-  status: SampleStatusFilter;
+export interface DateRange {
   from: Date | null;
   /** Exclusive when `to` was a plain date (start of the next day), otherwise inclusive. */
   to: { date: Date; exclusive: boolean } | null;
+}
+
+/** Parses `from` and `to`; shared by the list, stats and export endpoints. */
+export function parseRange(query: Query): DateRange {
+  const from = readDate(query, 'from');
+  const toDate = readDate(query, 'to');
+  const to = toDate && { date: toDate, exclusive: DATE_ONLY.test(String(query.to)) };
+  if (from && to && (to.exclusive ? from >= to.date : from > to.date))
+    invalid('INVALID_DATE', 'from must be before to');
+  return { from, to };
+}
+
+function parseStatus(query: Query): SampleStatusFilter {
+  const status = query.status ?? 'all';
+  if (status !== 'all' && status !== 'ok' && status !== 'failed') {
+    invalid('INVALID_STATUS', 'status must be all, ok or failed');
+  }
+  return status;
+}
+
+export interface ListQuery extends DateRange {
+  limit: number;
+  cursor: Cursor | null;
+  status: SampleStatusFilter;
+  /** Null means samples with and without photos. */
+  hasPhoto: boolean | null;
+  order: SampleOrder;
 }
 
 export function parseListQuery(query: Query): ListQuery {
@@ -145,24 +169,56 @@ export function parseListQuery(query: Query): ListQuery {
     if (limit < 1 || limit > 500) invalid('INVALID_LIMIT', 'limit must be between 1 and 500');
   }
 
-  const status = query.status ?? 'all';
-  if (status !== 'all' && status !== 'ok' && status !== 'failed') {
-    invalid('INVALID_STATUS', 'status must be all, ok or failed');
-  }
-
   let cursor: Cursor | null = null;
   if (query.cursor !== undefined) {
     if (typeof query.cursor !== 'string') invalid('INVALID_CURSOR', 'cursor must be a string');
     cursor = decodeCursor(query.cursor);
   }
 
-  const from = readDate(query, 'from');
-  const toDate = readDate(query, 'to');
-  const to = toDate && { date: toDate, exclusive: DATE_ONLY.test(String(query.to)) };
-  if (from && to && (to.exclusive ? from >= to.date : from > to.date))
-    invalid('INVALID_DATE', 'from must be before to');
+  let hasPhoto: boolean | null = null;
+  if (query.hasPhoto !== undefined) {
+    if (query.hasPhoto !== 'true' && query.hasPhoto !== 'false') {
+      invalid('INVALID_HAS_PHOTO', 'hasPhoto must be true or false');
+    }
+    hasPhoto = query.hasPhoto === 'true';
+  }
 
-  return { limit, cursor, status, from, to };
+  const order = query.order ?? 'desc';
+  if (order !== 'desc' && order !== 'asc') invalid('INVALID_ORDER', 'order must be desc or asc');
+
+  return { limit, cursor, status: parseStatus(query), hasPhoto, order, ...parseRange(query) };
+}
+
+const TIMEZONE_NAME = /^[A-Za-z][A-Za-z0-9_+\-/]{0,63}$/;
+
+/**
+ * Returns the `tz` query value when it is shaped like a timezone name, or null when absent.
+ * Whether Postgres knows the zone is checked separately (see services/timezones.ts).
+ */
+export function parseTimezoneParam(query: Query): string | null {
+  const tz = query.tz;
+  if (tz === undefined) return null;
+  if (typeof tz !== 'string' || !TIMEZONE_NAME.test(tz)) {
+    invalid('INVALID_TIMEZONE', 'tz must be an IANA timezone such as Asia/Dhaka');
+  }
+  return tz;
+}
+
+export interface ExportQuery extends DateRange {
+  status: SampleStatusFilter;
+  tz: string | null;
+}
+
+export function parseExportQuery(query: Query): ExportQuery {
+  return { status: parseStatus(query), tz: parseTimezoneParam(query), ...parseRange(query) };
+}
+
+export interface StatsQuery extends DateRange {
+  tz: string | null;
+}
+
+export function parseStatsQuery(query: Query): StatsQuery {
+  return { tz: parseTimezoneParam(query), ...parseRange(query) };
 }
 
 /** Parses a sample id path parameter; returns null when it cannot be a valid id. */
