@@ -38,6 +38,10 @@ hold-until-clear behavior has been replaced by the requested timed sample cycle.
    Car is stopped
    ```
 
+   When acquisition finishes (both reads done, or the 3-second limit), before the
+   readings screen, one packet is sent to the ESP32-CAM: `<S,T=30,H=66,L=235>\n`
+   on success or `<F>\n` on failure. See [ESP32-CAM UART link](#esp32-cam-uart-link).
+
 5. Resume the saved line-following state even if that same object remains near.
    The display says `Object sampled` while still near it, then `No object` when
    clear. After **500 ms of clear readings**, another object can trigger a stop.
@@ -88,12 +92,45 @@ OLED and BH1750 already use the correct shared bus and addresses.
 | Shared TWI SCL, SDA | PC0, PC1 |
 | OLED address | 0x3C |
 | BH1750 address | 0x23 |
+| ESP32-CAM RX (GPIO14) | PD1/TXD via 1kΩ/2kΩ divider; common GND |
 
 Move HC-SR04 ECHO from PA1 to PA4 before Stage 5. Keep the known-working sensor
 power connections, common ground and I2C pull-ups. For the 40-pin DIP ATmega32A,
 AVCC pin 30 must be connected to 5 V and GND pin 31 to ground, as specified in
 your wiring. The firmware assumes a real 1 MHz CPU clock. Defining `F_CPU` does
 not change the chip's clock or fuses.
+
+## ESP32-CAM UART link
+
+`uart.c` is a blocking, **transmit-only** USART driver linked into Stage 6 only.
+`uart_init()` runs once at startup (in `main.c`, after `sample_cycle_init()`).
+It sets `UBRR` from `F_CPU` and `UART_BAUD` (`config.h`, default `9600UL`) in
+double-speed mode: `UBRR = F_CPU / (8 × baud) − 1`, rounded, giving 12 for 9600
+(9615 baud, +0.2%) and 25 for 4800. Normal mode at 1 MHz would be about 7% off.
+A compile-time check rejects any `UART_BAUD` with more than 2% error. Only
+`TXEN` is set, with 8N1 through `UCSRC` (`URSEL` set); RX and all USART
+interrupts stay disabled, so PD0 remains a free input.
+
+Pins and resources: PD1/TXD and PD0/RXD were not used by any module (PORTD only
+drives PD4/PD5 for the L298N enables). The USART has its own baud generator and
+uses no timer, so Timer0/1/2 ownership is unchanged.
+
+`sample_cycle_dht_done()` and `sample_cycle_light_done()` now also receive the
+readings (`temperature`, `humidity` as the DHT11's `uint8_t` integer bytes, `lux`
+as `uint16_t`). `sample_cycle_update()` sends exactly one packet at the single
+`SAMPLE_ACQUIRING` → `SAMPLE_READINGS` transition, when `succeeded` becomes final:
+
+```text
+<S,T=30,H=66,L=235>\n    uart_send_sample(temp_c, humidity, lux)
+<F>\n                    uart_send_sample_failed()
+```
+
+Numbers are formatted with integer division only (no `printf`). Temperature is
+passed as `int16_t` and printed with a sign when negative, although the DHT11
+driver itself reports 0–50 °C. The motors are held by the line pause at that
+moment. A packet blocks the loop for about 1 ms per byte (up to ~21 ms for a
+success line, ~4 ms for `<F>`); Timer0 keeps running and the readings screen
+then lasts the unchanged 2 seconds. No bytes are sent during line following.
 
 ## Timer strategy
 
@@ -201,6 +238,7 @@ sylvan/
     ├── bh1750.c / bh1750.h
     ├── oled.c / oled.h
     ├── twi.c / twi.h
+    ├── uart.c / uart.h           Stage 6 ESP32-CAM transmitter
     ├── Makefile
     ├── .gitignore
     ├── lfr.c                     unchanged reference
@@ -218,6 +256,7 @@ sylvan/
     │   ├── test_i2c_clients.c
     │   ├── test_sample_cycle.c
     │   ├── test_sampling_main.c
+    │   ├── test_uart.c
     │   ├── run_tests.py
     │   ├── simavr_integration.c
     │   └── run_simavr.py
@@ -264,7 +303,8 @@ make
 make flash
 ```
 
-`make` compiles `main.c` **and the modules enabled for the selected stage**, links
+`make` compiles `main.c` **and the modules enabled for the selected stage**
+(`uart.c` only in Stage 6), links
 them, and produces HEX. `make flash` rebuilds dependencies and programs that
 stage's HEX with USBasp and `-p m32 -B 8`, including avrdude verification.
 
@@ -332,8 +372,18 @@ directory containing `simavr/` and `SIMAVR_LIB_DIR` to the directory containing
   its original mode and the motors are disabled while Timer2 measures a sensor.
   Successful OLED/BH1750 bus behavior is covered by the host tests, not this
   disconnected-bus simulation.
-- Stage 6 uses 6,854 bytes of flash (`.text + .data`) and 544 bytes of static SRAM
+- UART host tests capture every `UDR` write through the fake AVR header. They
+  check the 9600 8N1 U2X TX-only register setup, exact packets (including
+  `T=-5`, zero and integer limits), `<F>\n` for failures and timeouts, and that
+  each sampling stop sends exactly one packet regardless of loop passes. The
+  actual `main.c` loop test checks both packets and that no byte is sent while
+  the line follower is driving.
+- `make test-sim` also checks the ELF's USART output (`<F>` per sample, since the
+  simulated bus has no BH1750, with motors stopped). That UART addition has not
+  yet been run, because simavr was not installed when it was written.
+- Stage 6 uses 7,214 bytes of flash (`.text + .data`) and 567 bytes of static SRAM
   (`.data + .bss`); stack use is additional and has not been measured on hardware.
+  Before the UART link it used 6,854 and 544 bytes.
 
 The simavr 1.6 ATmega32 core shares a Timer0 model without CTC mode. The harness
 adds the documented WGM bits and CTC entry **to the simulation model only**.
@@ -399,6 +449,9 @@ stage at a time when diagnosing an individual subsystem.
       complete cycle repeats. Check spacing on the real track.
 - [ ] Test an absent DHT11 and BH1750 separately: expect `ERR` and `Sample failed`,
       then resumption; reconnect and confirm the next object's sample succeeds.
+- [ ] With the ESP32-CAM connected, confirm one `<S,T=..,H=..,L=..>` line per
+      successful stop and one `<F>` per failed stop, and no data while driving.
+      If lines are garbled, try `UART_BAUD 4800UL` on both sides.
 - [ ] Trigger a sample during line recovery; confirm the remaining recovery time
       resumes afterward. Check short ultrasonic pauses and threshold jitter on
       the complete track.

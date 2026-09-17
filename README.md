@@ -3,6 +3,8 @@
 An ATmega32A line-following rover that stops beside an object, records temperature,
 humidity and light, shows the result on an OLED, then continues along the line.
 The firmware runs at **1 MHz** and is built from `car/`.
+The web platform that receives the ESP32-CAM uploads is described in
+[Web platform](#web-platform).
 
 ## Current progress
 
@@ -28,7 +30,8 @@ The firmware runs at **1 MHz** and is built from `car/`.
 3. Keep the readings on screen for **2 seconds**.
 4. Show `Sample detected` / `successfully` for **2 seconds**, then resume the
    saved line-following state. If a reading fails, show `Sample failed` /
-   `Check sensors` instead, then resume.
+   `Check sensors` instead, then resume. One UART packet with the result is sent
+   to the ESP32-CAM when acquisition finishes, while the motors are stopped.
 5. Continue past that object. Detection rearms after **500 ms** of clear space
    (no echo or a reading above **35 cm**) so the same object does not cause
    repeated stops.
@@ -47,10 +50,26 @@ can affect physical movement compared with running `lfr.c` alone.
 | HC-SR04 TRIG, ECHO | PA0, PA4 |
 | DHT11 DATA | PA3 |
 | OLED and BH1750 SCL, SDA | PC0, PC1 |
+| ESP32-CAM RX (GPIO14) | PD1/TXD via 1kΩ/2kΩ divider |
 
 OLED address: **0x3C**. BH1750 address: **0x23**. Keep a common ground, the I2C
 pull-ups and the ATmega32A AVCC/GND connections. `F_CPU=1000000UL` assumes the
 MCU is actually running at 1 MHz; the build does not change fuse bits.
+
+### ESP32-CAM data link
+
+The ATmega only transmits (PD1/TXD; PD0/RXD is unused). The link is **9600 baud,
+8N1**, using the USART double-speed mode (`U2X`, `UBRR=12`, 0.2% error at 1 MHz).
+Normal mode would be about 7% off. Each sampling stop sends exactly one line:
+
+```text
+<S,T=30,H=66,L=235>\n    success: temperature °C, humidity %, light lux (integers)
+<F>\n                    any sensor read failed or timed out
+```
+
+Lines end with `\n` only. Nothing is sent while following the line. If the
+internal RC oscillator drifts too far, set `UART_BAUD` to `4800UL` in
+`car/config.h` (and on the ESP32); the build rejects rates with more than 2% error.
 
 ## Build and flash
 
@@ -84,16 +103,271 @@ modular line follower alone, use `make STAGE=1` and `make STAGE=1 flash`.
 | `car/line_follow.c`, `car/motor.c`, `car/line_sensor.c` | Logic and settings extracted from `lfr.c` |
 | `car/hcsr04.c`, `car/dht11.c`, `car/bh1750.c` | Sensor drivers |
 | `car/oled.c`, `car/twi.c` | OLED and shared I2C bus |
+| `car/uart.c` | Transmit-only ESP32-CAM packets (Stage 6) |
 | `car/timebase.c`, `car/config.h` | Scheduler clock and hardware configuration |
 | `car/oled_debug.c` | Isolated OLED check |
 
-`make test` runs line-output comparisons and sampling/display tests. `make stages`
+`make test` runs line-output comparisons and sampling/display/UART packet tests. `make stages`
 builds all six incremental stages. `make test-sim` runs the optional simavr
 checks when its development files are installed.
 
 See [`car/INTEGRATION.md`](car/INTEGRATION.md) for the timer-conflict report,
 full build stages and hardware checklist. [`car/SOURCE_BUNDLE.md`](car/SOURCE_BUNDLE.md)
 contains the complete modular source listings.
+
+---
+
+# Web platform
+
+The ESP32-CAM sends each sampling result and a JPEG photo to a self-hosted server. The platform is
+being built in five phases:
+
+1. **Backend foundation** (done): project structure, PostgreSQL, upload API, photo storage and
+   local Docker setup
+2. Dashboard frontend (React)
+3. Realtime WebSockets: device heartbeat, live camera stream, instant updates
+4. Explore analytics, admin area, security hardening
+5. Production deployment on the VPS
+
+## What Phase 1 includes
+
+- A Fastify + TypeScript API (`server/`) with a fixed upload contract for the ESP32
+- PostgreSQL 17 with a small numbered-SQL migration runner (`schema_migrations`)
+- Photo storage on disk (`YYYY/MM/<uuid>.jpg`) with atomic writes and cleanup when an upload fails
+- Idempotent uploads through `X-Upload-Id`, including two identical requests arriving at once
+- Public read API with keyset pagination and filters
+- Shared API types (`shared/`) for the Phase 2 frontend
+- Docker Compose for local development. The app listens on `127.0.0.1:3100` only, the database
+  publishes no port, and both containers have memory limits.
+- Vitest suite (86 tests) against a real PostgreSQL test database, plus ESLint, Prettier and strict
+  TypeScript
+
+## Local setup
+
+**Prerequisites:** Node.js 22.13+, npm 10+, Docker with Compose v2, `openssl`, `curl`.
+
+```bash
+npm install
+
+# 1. Configuration: copy the example and replace every secret.
+cp .env.example .env
+openssl rand -hex 32   # paste as DEVICE_KEY (the same value goes in the ESP32 firmware)
+openssl rand -hex 16   # paste as DB_PASSWORD and inside DATABASE_URL
+chmod 600 .env
+
+# 2. Photo folder owned by you (the container runs as uid 1000).
+mkdir -p data/photos
+
+# 3. Start PostgreSQL + the API. The app applies migrations when it starts.
+docker compose up -d --build
+docker compose ps                     # both services should become "healthy"
+curl http://127.0.0.1:3100/api/health
+
+# 4. Optional demo data (60 samples over the last 14 days, some with photos)
+npm run db:up                         # publishes the database on 127.0.0.1:5433 for host tools
+SEED_CONFIRM=yes npm run db:seed
+```
+
+`npm run db:migrate` applies migrations by hand. It is safe to run repeatedly.
+
+### Host-side development (no image rebuilds)
+
+`npm run dev`, `npm test`, `npm run db:migrate` and `npm run db:seed` run on your machine. They
+reach the Compose database through the opt-in `docker-compose.db-port.yml` override, which
+publishes it on `127.0.0.1:5433`. Create `.env.local` (git-ignored). It is read before `.env` and
+holds the host-side values:
+
+```bash
+HOST=127.0.0.1
+DATABASE_URL=postgres://sylvan:<DB_PASSWORD>@127.0.0.1:5433/sylvan
+PHOTO_DIR=./data/photos
+```
+
+```bash
+npm run db:up        # database only, with 127.0.0.1:5433 published
+npm run dev          # tsx watch on http://127.0.0.1:3100 (stop the app container first)
+```
+
+Real environment variables always win over both files. Inside Compose, `HOST`, `PORT`, `PHOTO_DIR`
+and `DATABASE_URL` are set by `docker-compose.yml`.
+
+### Configuration reference
+
+| Variable | Required | Notes |
+| --- | --- | --- |
+| `NODE_ENV` | no | `development` (default), `production` or `test` |
+| `PORT` / `HOST` | no | Defaults `3100` / `127.0.0.1` |
+| `DATABASE_URL` | yes | `postgres://` URL; never logged |
+| `DB_PASSWORD` | Compose | Used by the `db` container and the app's `DATABASE_URL` |
+| `DEVICE_KEY` | yes | At least 32 characters; the placeholder is rejected; never logged |
+| `PHOTO_DIR` | yes | Absolute, or relative to the repository root |
+| `MAX_PHOTO_BYTES` | no | Default `500000` |
+| `PUBLIC_BASE_URL` | yes | Public http(s) origin of the site |
+| `SERVE_PHOTOS` | no | Serve `/photos/*` from Node; defaults to `true` only in development |
+| `TRUST_PROXY` | no | Comma-separated proxy addresses trusted for `X-Forwarded-*` (default `127.0.0.1,::1`) |
+| `LOG_LEVEL` | no | Pino level, default `info` |
+
+The server checks all of these at startup and exits with a list of the variables that are wrong.
+The list never includes their values.
+
+## Running checks
+
+```bash
+npm run db:up        # tests need the database on 127.0.0.1:5433
+npm test             # Vitest; recreates the sylvan_test database on every run
+npm run typecheck
+npm run lint
+npm run format       # or format:check
+server/scripts/test-upload.sh   # end-to-end curl demo against a running server
+```
+
+Tests use `TEST_DATABASE_URL` when set. Otherwise they use `DATABASE_URL` with the database renamed
+to `sylvan_test`. They refuse any database whose name does not end in `_test`, and each run uses a
+temporary photo directory. `npm run fixtures -w server` regenerates the JPEG test fixture with
+`jpeg-js`.
+
+## API contract for the ESP32
+
+### `POST /api/samples`
+
+```text
+POST /api/samples?ok=1&t=30.0&h=66.0&l=235
+X-Device-Key: <DEVICE_KEY>
+X-Upload-Id: a1b2c3d4-17          (optional, recommended)
+Content-Type: image/jpeg          (may be omitted when the body is empty)
+<raw JPEG bytes, or empty body if the photo failed>
+```
+
+| Query | Rule |
+| --- | --- |
+| `ok` | `1` = readings valid, `0` = sensor read failed |
+| `t` | Temperature °C, −40 to 80 (stored with one decimal). Required when `ok=1`, absent when `ok=0` |
+| `h` | Relative humidity %, 0 to 100 (one decimal). Required when `ok=1`, absent when `ok=0` |
+| `l` | Light, whole lux 0 to 65535. Required when `ok=1`, absent when `ok=0` |
+
+| Header | Rule |
+| --- | --- |
+| `X-Device-Key` | Shared secret, compared in constant time |
+| `X-Upload-Id` | 1–64 of `A-Z a-z 0-9 _ -`. Use a new value per sample and the **same value when retrying** it |
+
+The server checks requests in this order: device key, query, upload id, then body.
+
+| Status | When | Body |
+| --- | --- | --- |
+| `201` | Sample stored | `{"id":42,"photo":true}` |
+| `200` | `X-Upload-Id` already stored (a retry); nothing new is saved | `{"id":42,"photo":true}` (the original) |
+| `400` | Invalid query, upload id or JPEG | `{"error":{"code":"INVALID_TEMPERATURE","message":"t (temperature) must be between -40 and 80"}}` |
+| `401` | Missing or wrong device key | `{"error":{"code":"UNAUTHORIZED","message":"Missing or invalid device key"}}` |
+| `413` | Body larger than `MAX_PHOTO_BYTES` | `{"error":{"code":"PAYLOAD_TOO_LARGE",...}}` |
+| `415` | Non-empty body that is not `image/jpeg` | `{"error":{"code":"UNSUPPORTED_MEDIA_TYPE",...}}` |
+| `500` | Server or database error (safe to retry with the same upload id) | `{"error":{"code":"INTERNAL_ERROR","message":"Internal server error"}}` |
+
+`400` error codes: `INVALID_OK`, `READINGS_NOT_ALLOWED` (`ok=0` with `t`/`h`/`l`),
+`INVALID_TEMPERATURE`, `INVALID_HUMIDITY`, `INVALID_LUX`, `INVALID_UPLOAD_ID`, `INVALID_PHOTO` (body
+does not start with `FF D8`).
+
+**Firmware guidance:** treat `200` and `201` as success. Retry on a network error, timeout or `5xx`,
+using the same `X-Upload-Id`. Do not retry `4xx`, because repeating the same request cannot succeed.
+
+### Read API (public)
+
+| Endpoint | Description |
+| --- | --- |
+| `GET /api/health` | `200 {"status":"ok","db":"ok"}`, or `503 {"error":{"code":"DATABASE_UNAVAILABLE",...}}` |
+| `GET /api/samples` | `{"items": Sample[], "nextCursor": string \| null}`, newest first |
+| `GET /api/samples/:id` | One `Sample`, or `404 {"error":{"code":"NOT_FOUND",...}}` |
+| `GET /photos/YYYY/MM/<uuid>.jpg` | Photo file (development only; nginx serves it in production) |
+
+`GET /api/samples` query parameters:
+
+- `limit`: 1–500, default 50
+- `cursor`: the `nextCursor` value from the previous page
+- `status`: `all` (default), `ok` or `failed`
+- `from`: ISO date or date-time, inclusive
+- `to`: ISO date (includes that whole UTC day) or date-time (inclusive)
+
+Invalid values return `400` with `INVALID_LIMIT`, `INVALID_CURSOR`, `INVALID_STATUS` or `INVALID_DATE`.
+
+```json
+{
+  "id": 61,
+  "createdAt": "2026-09-17T16:59:15.197Z",
+  "ok": true,
+  "temperature": 30,
+  "humidity": 66,
+  "lux": 235,
+  "photoUrl": "/photos/2026/09/c9235951-2dbe-44ac-9fe4-ffbee29f3ff4.jpg",
+  "photoBytes": 1325
+}
+```
+
+All errors use `{"error":{"code","message"}}`. Stack traces and SQL errors are never sent to clients.
+
+## curl examples
+
+```bash
+KEY=<DEVICE_KEY>
+API=http://127.0.0.1:3100
+
+# Successful sample with a photo
+curl -X POST "$API/api/samples?ok=1&t=30.0&h=66.0&l=235" \
+  -H "X-Device-Key: $KEY" -H "X-Upload-Id: a1b2c3d4-17" \
+  -H "Content-Type: image/jpeg" --data-binary @server/test/fixtures/sample.jpg
+# 201 {"id":61,"photo":true}
+
+# Retry of the same sample: returns the same id, stores nothing
+# (same command again)  → 200 {"id":61,"photo":true}
+
+# Sensor failure, no photo
+curl -X POST "$API/api/samples?ok=0" -H "X-Device-Key: $KEY"
+# 201 {"id":62,"photo":false}
+
+# Wrong key
+curl -X POST "$API/api/samples?ok=0" -H "X-Device-Key: wrong"
+# 401 {"error":{"code":"UNAUTHORIZED","message":"Missing or invalid device key"}}
+
+# Newest 10 successful samples, then the next page
+curl "$API/api/samples?status=ok&limit=10"
+curl "$API/api/samples?status=ok&limit=10&cursor=<nextCursor>"
+```
+
+`server/scripts/test-upload.sh [base-url]` runs these checks and fails if any response is wrong. It
+reads `DEVICE_KEY` from the environment or `.env` and never prints it.
+
+## Platform folder structure
+
+```text
+package.json              npm workspaces root (shared, server) and scripts
+tsconfig.base.json        strict compiler settings shared by all packages
+eslint.config.js          ESLint (typescript-eslint strict, type-checked) + Prettier
+.env.example              configuration template (.env and .env.local are git-ignored)
+docker-compose.yml        db (postgres:17-alpine) + app; app on 127.0.0.1:3100 only
+docker-compose.db-port.yml  opt-in: publish the database on 127.0.0.1:5433 for host tools
+shared/src/types.ts       Sample, SampleListResponse, UploadResponse, ... (API types)
+server/
+  Dockerfile              multi-stage, non-root, production dependencies only
+  src/index.ts            startup, graceful SIGTERM/SIGINT shutdown
+  src/app.ts              builds the Fastify app (logging, trust proxy, error shape, routes)
+  src/config.ts           .env loading + Zod validation
+  src/db/                 postgres client, migration runner, numbered SQL migrations
+  src/routes/             health, samples (upload + read), photos (development only)
+  src/services/           samples (business logic, idempotency), photoStorage (atomic files)
+  src/lib/                auth (constant-time key check), validation, errors
+  scripts/                seed.ts, make-fixture.ts, test-upload.sh
+  test/                   Vitest suites, test DB setup, fixtures/sample.jpg
+web/                      Phase 2: React dashboard (placeholder)
+deploy/                   Phase 5: nginx + production Compose (placeholder)
+data/photos/              photo storage (git-ignored)
+```
+
+Later phases will add:
+- **Phase 2:** `web/` as a workspace importing `@sylvan/shared`
+- **Phase 3:** a WebSocket plugin registered in `app.ts` next to the existing routes
+- **Phase 4:** admin routes and hardening (rate limits, security headers)
+- **Phase 5:** `deploy/` with the nginx site, which serves `data/photos` directly with
+  `SERVE_PHOTOS=false`. Because the Docker port proxy makes requests appear to come from the
+  Compose network gateway, `TRUST_PROXY` must list that address.
+
 # sylvan
 # sylvan
 # sylvan

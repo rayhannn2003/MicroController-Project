@@ -11,6 +11,7 @@ static char *utoa(unsigned value, char *buffer, int base)
     sprintf(buffer, "%u", value);
     return buffer;
 }
+#include <avr/io.h>
 #define main rover_main
 #include "../main.c"
 #undef main
@@ -21,6 +22,12 @@ static uint8_t held, driving, clock_paused, bad_dht, missing_light;
 static unsigned stops, resumes, dht_reads, light_reads, successes, failures;
 static uint8_t saw_readings, saw_moving, result_seen;
 static char rows[4][22];
+static unsigned tx_at_release;
+
+static const char *expected_packet(void)
+{
+    return bad_dht || missing_light ? "<F>\n" : "<S,T=30,H=66,L=235>\n";
+}
 
 uint32_t timebase_millis(void)
 {
@@ -35,12 +42,17 @@ void motor_stop(void) { driving = 0; }
 uint8_t motor_is_driving(void) { return driving; }
 void line_sensor_init(void) {}
 void line_follow_init(uint32_t now) { (void)now; }
-void line_follow_update(uint32_t now) { driving = !held && now >= START_DELAY_MS; }
+void line_follow_update(uint32_t now)
+{
+    driving = !held && now >= START_DELAY_MS;
+    if (!held) assert(uart_tx_len == tx_at_release); /* No UART while line following. */
+}
 void line_follow_set_paused(uint8_t hold, uint32_t now)
 {
     held = hold;
     if (hold) {
         assert(!driving);
+        assert(uart_tx_len == tx_at_release);
         hold_at = now;
         stops++;
         result_seen = 0;
@@ -49,6 +61,7 @@ void line_follow_set_paused(uint8_t hold, uint32_t now)
         assert(now - result_at >= SAMPLE_RESULT_TIME_MS - 5);
         release_at = now;
         resumes++;
+        tx_at_release = uart_tx_len;
     }
 }
 void hcsr04_init(void) {}
@@ -98,6 +111,10 @@ void oled_service(uint32_t now)
         assert(!strcmp(rows[1], bad_dht ? "T:ERRC" : "T:30C"));
         assert(!strcmp(rows[2], missing_light ? "L:ERRLX" : "L:235LX"));
         assert(!strcmp(rows[3], bad_dht ? "H:ERR%" : "H:66%"));
+        /* The packet was sent once, when the result became known. */
+        const char *packet = expected_packet();
+        assert(uart_tx_len == tx_at_release + strlen(packet));
+        assert(!memcmp(uart_tx + tx_at_release, packet, strlen(packet)));
         saw_readings = 1;
     }
     if (phase == SAMPLE_RESULT && !result_seen) {
@@ -131,6 +148,12 @@ int main(int argc, char **argv)
     assert(release_at > 15000 && release_at < 19000);
     assert(successes == ((bad_dht || missing_light) ? 0U : 2U));
     assert(failures == ((bad_dht || missing_light) ? 2U : 0U));
-    printf("PASS: actual main loop completes two objects, %s, fresh samples and resume.\n",
-           bad_dht ? "DHT error" : missing_light ? "missing BH1750" : "success messages");
+    assert(UBRRL == 12 && UCSRB == (1 << TXEN));
+    const char *packet = expected_packet();
+    size_t length = strlen(packet);
+    assert(uart_tx_len == 2 * length && uart_udre_waits == uart_tx_len);
+    assert(!memcmp(uart_tx, packet, length) && !memcmp(uart_tx + length, packet, length));
+    printf("PASS: actual main loop completes two objects, %s, fresh samples and resume; UART sent %s twice.\n",
+           bad_dht ? "DHT error" : missing_light ? "missing BH1750" : "success messages",
+           bad_dht || missing_light ? "<F>" : "<S,T=30,H=66,L=235>");
 }

@@ -5,6 +5,12 @@ extern uint8_t DDRA, DDRB, DDRC, DDRD, PORTA, PORTB, PORTC, PORTD, PINA;
 extern uint8_t TCCR1A, TCCR1B, TCCR0, TCNT0, OCR0, TCCR2, TCNT2;
 extern uint8_t TIFR, TIMSK, SREG, TWSR, TWBR, TWCR, TWDR, ASSR;
 extern uint16_t ICR1, OCR1A, OCR1B;
+extern uint8_t UCSRA, UCSRB, UCSRC, UBRRH, UBRRL;
+/* Host capture: every write to UDR appends one byte; each UDRE wait is counted. */
+extern char uart_tx[512];
+extern unsigned uart_tx_len, uart_udre_waits;
+#define UDR uart_tx[uart_tx_len++ % sizeof uart_tx]
+#define loop_until_bit_is_set(sfr, bit) ((void)(sfr), (void)(bit), uart_udre_waits++)
 #define PA0 0
 #define PA1 1
 #define PA2 2
@@ -41,4 +47,10 @@ extern uint16_t ICR1, OCR1A, OCR1B;
 #define TWSTO 4
 #define TWEN 2
 #define TWEA 6
+#define U2X 1
+#define UDRE 5
+#define TXEN 3
+#define URSEL 7
+#define UCSZ1 2
+#define UCSZ0 1
 #endif

@@ -1,0 +1,171 @@
+import type { SampleStatusFilter } from '@sylvan/shared';
+import { AppError } from './errors.js';
+
+export interface Readings {
+  temperature: number;
+  humidity: number;
+  lux: number;
+}
+
+export type UploadQuery = { ok: true; readings: Readings } | { ok: false; readings: null };
+
+type Query = Record<string, unknown>;
+
+const DECIMAL = /^-?\d{1,3}(\.\d+)?$/;
+const UNSIGNED_INTEGER = /^\d{1,5}$/;
+const UPLOAD_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+function invalid(code: string, message: string): never {
+  throw new AppError(400, code, message);
+}
+
+function readDecimal(
+  query: Query,
+  key: string,
+  code: string,
+  label: string,
+  min: number,
+  max: number,
+) {
+  const raw = query[key];
+  if (raw === undefined) invalid(code, `${key} (${label}) is required when ok=1`);
+  if (typeof raw !== 'string' || !DECIMAL.test(raw)) {
+    invalid(code, `${key} (${label}) must be a number`);
+  }
+  // Stored as NUMERIC(5,1); round here so the stored and returned values agree.
+  const value = Math.round(Number(raw) * 10) / 10;
+  if (value < min || value > max)
+    invalid(code, `${key} (${label}) must be between ${min} and ${max}`);
+  return value;
+}
+
+/** Validates the query string of `POST /api/samples`, checking fields in a fixed order. */
+export function parseUploadQuery(query: Query): UploadQuery {
+  const ok = query.ok;
+  if (ok !== '0' && ok !== '1') invalid('INVALID_OK', 'ok must be 0 or 1');
+
+  if (ok === '0') {
+    const present = ['t', 'h', 'l'].filter((key) => query[key] !== undefined);
+    if (present.length > 0) {
+      invalid('READINGS_NOT_ALLOWED', `ok=0 must not include readings (got ${present.join(', ')})`);
+    }
+    return { ok: false, readings: null };
+  }
+
+  const temperature = readDecimal(query, 't', 'INVALID_TEMPERATURE', 'temperature', -40, 80);
+  const humidity = readDecimal(query, 'h', 'INVALID_HUMIDITY', 'humidity', 0, 100);
+
+  const rawLux = query.l;
+  if (rawLux === undefined) invalid('INVALID_LUX', 'l (lux) is required when ok=1');
+  if (typeof rawLux !== 'string' || !UNSIGNED_INTEGER.test(rawLux)) {
+    invalid('INVALID_LUX', 'l (lux) must be a whole number between 0 and 65535');
+  }
+  const lux = Number(rawLux);
+  if (lux > 65535) invalid('INVALID_LUX', 'l (lux) must be a whole number between 0 and 65535');
+
+  return { ok: true, readings: { temperature, humidity, lux } };
+}
+
+/** Returns the `X-Upload-Id` header value, or null when the header is absent. */
+export function parseUploadId(header: string | string[] | undefined): string | null {
+  if (header === undefined) return null;
+  if (typeof header !== 'string' || !UPLOAD_ID.test(header)) {
+    invalid('INVALID_UPLOAD_ID', 'X-Upload-Id must be 1-64 characters of A-Z, a-z, 0-9, _ or -');
+  }
+  return header;
+}
+
+export interface Cursor {
+  /** `created_at` as text with microsecond precision, compared in SQL as timestamptz. */
+  createdAt: string;
+  id: string;
+}
+
+export function encodeCursor(cursor: Cursor): string {
+  return Buffer.from(JSON.stringify([cursor.createdAt, cursor.id])).toString('base64url');
+}
+
+const CURSOR_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/;
+const ID = /^[1-9]\d{0,18}$/;
+
+function decodeCursor(raw: string): Cursor {
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'));
+    if (
+      Array.isArray(parsed) &&
+      parsed.length === 2 &&
+      typeof parsed[0] === 'string' &&
+      typeof parsed[1] === 'string' &&
+      CURSOR_TIMESTAMP.test(parsed[0]) &&
+      ID.test(parsed[1])
+    ) {
+      return { createdAt: parsed[0], id: parsed[1] };
+    }
+  } catch {
+    // Fall through to the error below.
+  }
+  invalid('INVALID_CURSOR', 'cursor is not valid; use nextCursor from a previous response');
+}
+
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+const DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/;
+
+function readDate(query: Query, key: 'from' | 'to'): Date | null {
+  const raw = query[key];
+  if (raw === undefined) return null;
+  if (typeof raw !== 'string' || !(DATE_ONLY.test(raw) || DATE_TIME.test(raw))) {
+    invalid(
+      'INVALID_DATE',
+      `${key} must be an ISO 8601 date (2026-09-17) or date-time with offset`,
+    );
+  }
+  const date = new Date(DATE_ONLY.test(raw) ? `${raw}T00:00:00Z` : raw);
+  if (Number.isNaN(date.getTime())) invalid('INVALID_DATE', `${key} is not a valid date`);
+  // A plain `to` date includes that whole UTC day.
+  if (key === 'to' && DATE_ONLY.test(raw)) date.setUTCDate(date.getUTCDate() + 1);
+  return date;
+}
+
+export interface ListQuery {
+  limit: number;
+  cursor: Cursor | null;
+  status: SampleStatusFilter;
+  from: Date | null;
+  /** Exclusive when `to` was a plain date (start of the next day), otherwise inclusive. */
+  to: { date: Date; exclusive: boolean } | null;
+}
+
+export function parseListQuery(query: Query): ListQuery {
+  let limit = 50;
+  if (query.limit !== undefined) {
+    if (typeof query.limit !== 'string' || !/^\d{1,3}$/.test(query.limit)) {
+      invalid('INVALID_LIMIT', 'limit must be a whole number between 1 and 500');
+    }
+    limit = Number(query.limit);
+    if (limit < 1 || limit > 500) invalid('INVALID_LIMIT', 'limit must be between 1 and 500');
+  }
+
+  const status = query.status ?? 'all';
+  if (status !== 'all' && status !== 'ok' && status !== 'failed') {
+    invalid('INVALID_STATUS', 'status must be all, ok or failed');
+  }
+
+  let cursor: Cursor | null = null;
+  if (query.cursor !== undefined) {
+    if (typeof query.cursor !== 'string') invalid('INVALID_CURSOR', 'cursor must be a string');
+    cursor = decodeCursor(query.cursor);
+  }
+
+  const from = readDate(query, 'from');
+  const toDate = readDate(query, 'to');
+  const to = toDate && { date: toDate, exclusive: DATE_ONLY.test(String(query.to)) };
+  if (from && to && (to.exclusive ? from >= to.date : from > to.date))
+    invalid('INVALID_DATE', 'from must be before to');
+
+  return { limit, cursor, status, from, to };
+}
+
+/** Parses a sample id path parameter; returns null when it cannot be a valid id. */
+export function parseSampleId(raw: string): string | null {
+  return ID.test(raw) && Number(raw) <= Number.MAX_SAFE_INTEGER ? raw : null;
+}

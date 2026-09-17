@@ -1,0 +1,73 @@
+name: sylvan
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sylvan
+      POSTGRES_DB: sylvan
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
+    # Tuned for a 1-CPU VPS shared with other sites.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - max_connections=30
+      - -c
+      - work_mem=4MB
+      - -c
+      - timezone=UTC
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    # No published ports. For local database tools or host-side `npm run dev` / `npm test`,
+    # use `npm run db:up`, which adds docker-compose.db-port.yml (127.0.0.1:5433:5432).
+    # ports:
+    #   - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U sylvan -d sylvan']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  app:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: sylvan-server:local
+    restart: unless-stopped
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    # Container-specific values override .env so the same .env also works for host-side dev.
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3100
+      PHOTO_DIR: /data/photos
+      DATABASE_URL: postgres://sylvan:${DB_PASSWORD}@db:5432/sylvan
+      NODE_OPTIONS: --max-old-space-size=256
+    ports:
+      - '127.0.0.1:3100:3100'
+    volumes:
+      - ./data/photos:/data/photos
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:3100/api/health']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
+volumes:
+  db-data:

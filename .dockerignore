@@ -1,0 +1,17 @@
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+.git
+.env
+.env.*
+data
+coverage
+car
+blink
+backup_code
+Sylvan
+.kilo
+web
+deploy
+server/test
+server/scripts

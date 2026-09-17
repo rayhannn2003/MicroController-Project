@@ -90,12 +90,19 @@ with tempfile.TemporaryDirectory(prefix='sylvan-tests-') as tmp:
         '-o', str(tmp/'i2c_clients')], check=True)
     subprocess.run([str(tmp/'i2c_clients')], check=True)
     subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2',
-        '-I'+str(root), str(root/'tests/test_sample_cycle.c'),
-        str(root/'sample_cycle.c'), '-o', str(tmp/'sample_cycle')], check=True)
+        '-I'+str(root/'tests/fake_avr'), '-I'+str(root), *[str(root/n) for n in
+        ['tests/test_uart.c', 'tests/registers.c', 'uart.c']],
+        '-o', str(tmp/'uart')], check=True)
+    subprocess.run([str(tmp/'uart')], check=True)
+    subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2',
+        '-I'+str(root/'tests/fake_avr'), '-I'+str(root), str(root/'tests/test_sample_cycle.c'),
+        str(root/'sample_cycle.c'), str(root/'uart.c'), str(root/'tests/registers.c'),
+        '-o', str(tmp/'sample_cycle')], check=True)
     subprocess.run([str(tmp/'sample_cycle')], check=True)
     subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2',
-        '-DINTEGRATION_STAGE=6', '-I'+str(root),
+        '-DINTEGRATION_STAGE=6', '-I'+str(root/'tests/fake_avr'), '-I'+str(root),
         str(root/'tests/test_sampling_main.c'), str(root/'sample_cycle.c'),
+        str(root/'uart.c'), str(root/'tests/registers.c'),
         '-o', str(tmp/'sampling_main')], check=True)
     for arguments in [[], ['bad-dht'], ['missing-light']]:
         subprocess.run([str(tmp/'sampling_main'), *arguments], check=True)

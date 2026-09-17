@@ -31,6 +31,8 @@
 #define TWI_SDA_PIN PC1
 #define OLED_ADDR 0x3C
 #define BH1750_ADDR 0x23
+/* ESP32-CAM link: PD1/TXD only, 8N1, U2X. Use 4800 if the RC oscillator drifts. */
+#define UART_BAUD 9600UL
 #define OBSTACLE_DISTANCE_CM 30U
 #define OBJECT_CLEAR_DISTANCE_CM 35U
 #define OBJECT_CLEAR_TIME_MS 500UL

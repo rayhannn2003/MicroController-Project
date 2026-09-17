@@ -27,7 +27,7 @@ ifneq ($(filter $(STAGE),5 6),)
 SOURCES += hcsr04.c
 endif
 ifeq ($(STAGE),6)
-SOURCES += sample_cycle.c
+SOURCES += sample_cycle.c uart.c
 endif
 OBJECTS := $(SOURCES:%.c=$(BUILD)/%.o)
 OLED_DEBUG_BUILD := .build/oled-debug

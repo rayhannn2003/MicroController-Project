@@ -4,7 +4,7 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parent.parent
 modules = ['motor', 'line_sensor', 'line_follow', 'sample_cycle', 'timebase', 'twi', 'oled',
-           'bh1750', 'dht11', 'hcsr04']
+           'bh1750', 'dht11', 'hcsr04', 'uart']
 files = ['main.c', 'oled_debug.c', 'config.h']
 for module in modules:
     files.extend([module+'.c', module+'.h'])

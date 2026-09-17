@@ -9,6 +9,7 @@
 #include <simavr/sim_io.h>
 #include <simavr/avr_ioport.h>
 #include <simavr/avr_timer.h>
+#include <simavr/avr_uart.h>
 #include <simavr/sim_cycle_timers.h>
 
 static avr_t *cpu;
@@ -18,6 +19,22 @@ static unsigned latest_cm, distance_addr, sweep, readings, worst_error;
 static unsigned dht_reads, dht_phase, bit_index, dht_disabled;
 static uint8_t dht_data[5];
 static uint64_t last_poll, max_poll_gap;
+static char uart_line[64];
+static unsigned uart_len, uart_packets;
+
+/* ESP32-CAM link. BH1750 is absent on this simulated bus, so every sample fails. */
+static void uart_output(avr_irq_t *irq, uint32_t value, void *unused)
+{
+    (void)irq; (void)unused;
+    assert(cpu->data[0x4a]==0 && cpu->data[0x48]==0); /* Motors stopped. */
+    assert(uart_len<sizeof uart_line);
+    uart_line[uart_len++]=(char)value;
+    if(value=='\n') {
+        assert(uart_len==4 && !memcmp(uart_line,"<F>\n",4));
+        uart_packets++;
+        uart_len=0;
+    }
+}
 
 static uint32_t symbol(elf_firmware_t *f, const char *name)
 {
@@ -132,6 +149,7 @@ int main(int argc, char **argv)
     avr_ioport_external_t external={.name='A',.mask=0x1e,.value=0x0e};
     avr_ioctl(cpu,AVR_IOCTL_IOPORT_SET_EXTERNAL('A'),&external);
     avr_raise_irq(echo,0);
+    avr_irq_register_notify(avr_io_getirq(cpu,AVR_IOCTL_UART_GETIRQ('0'),UART_IRQ_OUTPUT),uart_output,NULL);
     uint32_t poll_pc=symbol(&firmware,"timer_ticks");
     distance_addr=symbol(&firmware,"distance") & 0xffff;
     uint32_t temp_addr=symbol(&firmware,"temperature") & 0xffff;
@@ -140,7 +158,7 @@ int main(int argc, char **argv)
     uint32_t ms_addr=symbol(&firmware,"system_millis") & 0xffff;
     uint32_t phase_addr=symbol(&firmware,"cycle_phase") & 0xffff;
     unsigned drove_before=0, drove_after=0, saw_valid_dht=0, saw_bad_dht=0;
-    unsigned saw_result=0, cycle_stops=0, cycle_resumes=0, previous_phase=0;
+    unsigned saw_result=0, cycle_stops=0, cycle_resumes=0, previous_phase=0, results=0;
     uint32_t old_ms=0;
     while(cpu->cycle<20000000) {
         assert(avr_run(cpu)!=cpu_Crashed);
@@ -154,6 +172,7 @@ int main(int argc, char **argv)
         if (phase && cpu->cycle>10000) assert(pwm==0);
         if (phase==1 && previous_phase==0) cycle_stops++;
         if (phase==0 && previous_phase==3) cycle_resumes++;
+        if (phase==2 && previous_phase==1) results++;
         if (phase==3) saw_result=1;
         previous_phase=phase;
         if(!sweep) {
@@ -177,13 +196,15 @@ int main(int argc, char **argv)
     assert(max_poll_gap<100);
     assert(readings>40);
     assert(saw_result);
+    /* One packet per sampling result; the run may end while one is in flight. */
+    assert(uart_packets>=1 && (uart_packets==results || uart_packets+1==results));
     if(dht_disabled) assert(saw_bad_dht);
     else assert(saw_valid_dht && dht_reads>=1);
     if(!sweep) {
         assert(drove_before && drove_after && saw_bad_dht && dht_reads>=2);
         assert(cycle_stops==2 && cycle_resumes==2);
     }
-    printf("PASS: %u readings, <=%u cm echo error, max polling gap %llu us; logical clock %u ms.\n",
-        readings,worst_error,(unsigned long long)max_poll_gap,old_ms);
+    printf("PASS: %u readings, <=%u cm echo error, max polling gap %llu us; logical clock %u ms; %u UART packets.\n",
+        readings,worst_error,(unsigned long long)max_poll_gap,old_ms,uart_packets);
     avr_terminate(cpu);
 }

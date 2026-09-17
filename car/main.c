@@ -11,6 +11,7 @@
 #endif
 #if INTEGRATION_STAGE >= 6
 #include "sample_cycle.h"
+#include "uart.h"
 #endif
 
 #if INTEGRATION_STAGE >= 4
@@ -70,7 +71,7 @@ static uint8_t update_environment(uint32_t now)
         dht_status = dht11_read(&temperature, &humidity) == 0 ? 1 : 2;
         timebase_resume();
 #if INTEGRATION_STAGE >= 6
-        sample_cycle_dht_done(dht_status == 1);
+        sample_cycle_dht_done(dht_status == 1, temperature, humidity);
 #endif
         return 1;
     }
@@ -94,7 +95,7 @@ static uint8_t update_environment(uint32_t now)
 #endif
         light_status = bh1750_read_lux(&lux) ? 1 : 2;
 #if INTEGRATION_STAGE >= 6
-        sample_cycle_light_done(light_status == 1);
+        sample_cycle_light_done(light_status == 1, lux);
 #endif
         if (light_status == 2) light_attempt = timebase_millis();
         return 1;
@@ -180,6 +181,7 @@ int main(void)
     line_follow_init(timebase_millis());
 #if INTEGRATION_STAGE >= 6
     sample_cycle_init();
+    uart_init();
 #endif
 #if INTEGRATION_STAGE >= 2
     twi_init();

@@ -1,0 +1,39 @@
+{
+  "name": "sylvan",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Project Sylvan web platform",
+  "workspaces": [
+    "shared",
+    "server"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "dev": "npm run build -w shared && npm run dev -w server",
+    "build": "npm run build -w shared && npm run build -w server",
+    "typecheck": "npm run build -w shared && npm run typecheck -w server",
+    "db:up": "docker compose -f docker-compose.yml -f docker-compose.db-port.yml up -d db",
+    "db:migrate": "npm run db:migrate -w server",
+    "db:seed": "npm run db:seed -w server",
+    "test": "npm run build -w shared && npm test -w server",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.20.3",
+    "eslint": "^10.10.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.12.0",
+    "jpeg-js": "^0.4.4",
+    "prettier": "^3.9.7",
+    "tsx": "^4.23.13",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.70.0",
+    "vitest": "^5.0.1"
+  }
+}

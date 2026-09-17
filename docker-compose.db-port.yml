@@ -1,0 +1,7 @@
+# Opt-in override for local development only: publishes Postgres on the loopback interface
+# so host-side `npm run dev`, `npm test` and database tools can reach it.
+#   docker compose -f docker-compose.yml -f docker-compose.db-port.yml up -d db
+services:
+  db:
+    ports:
+      - '127.0.0.1:5433:5432'

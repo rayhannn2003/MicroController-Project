@@ -2,10 +2,14 @@
 #include "sample_cycle.h"
 #include "hcsr04.h"
 #include "line_follow.h"
+#include "uart.h"
 
 static sample_phase_t cycle_phase;
 static uint8_t armed, near_object, clearing, dht_done, light_done, succeeded;
 static uint32_t phase_started, clear_started;
+static int16_t sample_temp_c;
+static uint8_t sample_humidity;
+static uint16_t sample_lux;
 
 void sample_cycle_init(void)
 {
@@ -45,6 +49,9 @@ void sample_cycle_update(uint32_t now)
         if ((!dht_done || !light_done) &&
             (uint32_t)(now - phase_started) < SAMPLE_ACQUIRE_TIMEOUT_MS) return;
         if (!dht_done || !light_done) succeeded = 0;
+        /* Motors are held; this transition runs exactly once per sampling stop. */
+        if (succeeded) uart_send_sample(sample_temp_c, sample_humidity, sample_lux);
+        else uart_send_sample_failed();
         cycle_phase = SAMPLE_READINGS;
         phase_started = now;
     } else if (cycle_phase == SAMPLE_READINGS &&
@@ -68,16 +75,19 @@ uint8_t sample_cycle_needs_light(uint32_t now)
     return cycle_phase == SAMPLE_ACQUIRING && !light_done &&
            (uint32_t)(now - phase_started) >= SAMPLE_LIGHT_SETTLE_MS;
 }
-void sample_cycle_dht_done(uint8_t success)
+void sample_cycle_dht_done(uint8_t success, int16_t temp_c, uint8_t humidity)
 {
     if (cycle_phase != SAMPLE_ACQUIRING || dht_done) return;
     dht_done = 1;
+    sample_temp_c = temp_c;
+    sample_humidity = humidity;
     succeeded &= success != 0;
 }
-void sample_cycle_light_done(uint8_t success)
+void sample_cycle_light_done(uint8_t success, uint16_t lux)
 {
     if (cycle_phase != SAMPLE_ACQUIRING || light_done) return;
     light_done = 1;
+    sample_lux = lux;
     succeeded &= success != 0;
 }
 uint8_t sample_cycle_succeeded(void) { return succeeded; }

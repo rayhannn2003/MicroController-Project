@@ -1,0 +1,14 @@
+# Firmware and archives are not part of the web platform
+car/
+blink/
+backup_code/
+Sylvan/
+.kilo/
+README.md
+
+node_modules/
+dist/
+data/
+coverage/
+package-lock.json
+server/test/fixtures/

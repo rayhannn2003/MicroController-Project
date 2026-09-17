@@ -18,6 +18,7 @@ Generated with `make source-bundle`. See [INTEGRATION.md](INTEGRATION.md) for co
 #endif
 #if INTEGRATION_STAGE >= 6
 #include "sample_cycle.h"
+#include "uart.h"
 #endif
 
 #if INTEGRATION_STAGE >= 4
@@ -77,7 +78,7 @@ static uint8_t update_environment(uint32_t now)
         dht_status = dht11_read(&temperature, &humidity) == 0 ? 1 : 2;
         timebase_resume();
 #if INTEGRATION_STAGE >= 6
-        sample_cycle_dht_done(dht_status == 1);
+        sample_cycle_dht_done(dht_status == 1, temperature, humidity);
 #endif
         return 1;
     }
@@ -101,7 +102,7 @@ static uint8_t update_environment(uint32_t now)
 #endif
         light_status = bh1750_read_lux(&lux) ? 1 : 2;
 #if INTEGRATION_STAGE >= 6
-        sample_cycle_light_done(light_status == 1);
+        sample_cycle_light_done(light_status == 1, lux);
 #endif
         if (light_status == 2) light_attempt = timebase_millis();
         return 1;
@@ -187,6 +188,7 @@ int main(void)
     line_follow_init(timebase_millis());
 #if INTEGRATION_STAGE >= 6
     sample_cycle_init();
+    uart_init();
 #endif
 #if INTEGRATION_STAGE >= 2
     twi_init();
@@ -286,6 +288,8 @@ int main(void)
 #define TWI_SDA_PIN PC1
 #define OLED_ADDR 0x3C
 #define BH1750_ADDR 0x23
+/* ESP32-CAM link: PD1/TXD only, 8N1, U2X. Use 4800 if the RC oscillator drifts. */
+#define UART_BAUD 9600UL
 #define OBSTACLE_DISTANCE_CM 30U
 #define OBJECT_CLEAR_DISTANCE_CM 35U
 #define OBJECT_CLEAR_TIME_MS 500UL
@@ -962,10 +966,14 @@ void line_follow_set_paused(uint8_t paused, uint32_t now);
 #include "sample_cycle.h"
 #include "hcsr04.h"
 #include "line_follow.h"
+#include "uart.h"
 
 static sample_phase_t cycle_phase;
 static uint8_t armed, near_object, clearing, dht_done, light_done, succeeded;
 static uint32_t phase_started, clear_started;
+static int16_t sample_temp_c;
+static uint8_t sample_humidity;
+static uint16_t sample_lux;
 
 void sample_cycle_init(void)
 {
@@ -1005,6 +1013,9 @@ void sample_cycle_update(uint32_t now)
         if ((!dht_done || !light_done) &&
             (uint32_t)(now - phase_started) < SAMPLE_ACQUIRE_TIMEOUT_MS) return;
         if (!dht_done || !light_done) succeeded = 0;
+        /* Motors are held; this transition runs exactly once per sampling stop. */
+        if (succeeded) uart_send_sample(sample_temp_c, sample_humidity, sample_lux);
+        else uart_send_sample_failed();
         cycle_phase = SAMPLE_READINGS;
         phase_started = now;
     } else if (cycle_phase == SAMPLE_READINGS &&
@@ -1028,16 +1039,19 @@ uint8_t sample_cycle_needs_light(uint32_t now)
     return cycle_phase == SAMPLE_ACQUIRING && !light_done &&
            (uint32_t)(now - phase_started) >= SAMPLE_LIGHT_SETTLE_MS;
 }
-void sample_cycle_dht_done(uint8_t success)
+void sample_cycle_dht_done(uint8_t success, int16_t temp_c, uint8_t humidity)
 {
     if (cycle_phase != SAMPLE_ACQUIRING || dht_done) return;
     dht_done = 1;
+    sample_temp_c = temp_c;
+    sample_humidity = humidity;
     succeeded &= success != 0;
 }
-void sample_cycle_light_done(uint8_t success)
+void sample_cycle_light_done(uint8_t success, uint16_t lux)
 {
     if (cycle_phase != SAMPLE_ACQUIRING || light_done) return;
     light_done = 1;
+    sample_lux = lux;
     succeeded &= success != 0;
 }
 uint8_t sample_cycle_succeeded(void) { return succeeded; }
@@ -1059,8 +1073,9 @@ sample_phase_t sample_cycle_phase(void);
 uint8_t sample_cycle_near_object(void);
 uint8_t sample_cycle_needs_dht(void);
 uint8_t sample_cycle_needs_light(uint32_t now);
-void sample_cycle_dht_done(uint8_t success);
-void sample_cycle_light_done(uint8_t success);
+/* Readings are kept for the UART packet sent once when the result is known. */
+void sample_cycle_dht_done(uint8_t success, int16_t temp_c, uint8_t humidity);
+void sample_cycle_light_done(uint8_t success, uint16_t lux);
 uint8_t sample_cycle_succeeded(void);
 #endif
 ```
@@ -2286,6 +2301,95 @@ uint16_t hcsr04_get_distance_cm(void);
 #endif
 ```
 
+## uart.c
+
+```c
+#include "config.h"
+#include "uart.h"
+#include <avr/io.h>
+
+/* Double-speed mode: baud = F_CPU / (8 * (UBRR + 1)), rounded to nearest. */
+#define UART_UBRR ((F_CPU + 4UL * UART_BAUD) / (8UL * UART_BAUD) - 1UL)
+#define UART_ACTUAL_BAUD (F_CPU / (8UL * (UART_UBRR + 1UL)))
+#if UART_UBRR > 4095UL
+#error "UART_BAUD is too low for F_CPU"
+#endif
+#if (UART_ACTUAL_BAUD > UART_BAUD ? UART_ACTUAL_BAUD - UART_BAUD : \
+     UART_BAUD - UART_ACTUAL_BAUD) * 1000UL > UART_BAUD * 20UL
+#error "UART_BAUD has more than 2% error at F_CPU with U2X"
+#endif
+
+void uart_init(void)
+{
+    /* UBRRH shares its address with UCSRC; URSEL clear selects UBRRH. */
+    UBRRH = (uint8_t)(UART_UBRR >> 8);
+    UBRRL = (uint8_t)UART_UBRR;
+    UCSRA = (1 << U2X);
+    UCSRC = (1 << URSEL) | (1 << UCSZ1) | (1 << UCSZ0);
+    UCSRB = (1 << TXEN);
+}
+
+void uart_putc(char c)
+{
+    loop_until_bit_is_set(UCSRA, UDRE);
+    UDR = (uint8_t)c;
+}
+
+void uart_puts(const char *s)
+{
+    while (*s) uart_putc(*s++);
+}
+
+static void put_uint(uint16_t value)
+{
+    char digits[5];
+    uint8_t count = 0;
+    do {
+        digits[count++] = (char)('0' + value % 10U);
+        value /= 10U;
+    } while (value);
+    while (count) uart_putc(digits[--count]);
+}
+
+void uart_send_sample(int16_t temp_c, uint8_t humidity, uint16_t lux)
+{
+    uart_puts("<S,T=");
+    if (temp_c < 0) {
+        uart_putc('-');
+        put_uint((uint16_t)(0U - (uint16_t)temp_c));
+    } else {
+        put_uint((uint16_t)temp_c);
+    }
+    uart_puts(",H=");
+    put_uint(humidity);
+    uart_puts(",L=");
+    put_uint(lux);
+    uart_puts(">\n");
+}
+
+void uart_send_sample_failed(void)
+{
+    uart_puts("<F>\n");
+}
+```
+
+## uart.h
+
+```c
+#ifndef UART_H
+#define UART_H
+#include <stdint.h>
+/* Blocking, transmit-only USART on PD1/TXD: UART_BAUD, 8N1, U2X, no interrupts. */
+void uart_init(void);
+void uart_putc(char c);
+void uart_puts(const char *s);
+/* Sends "<S,T=<temp_c>,H=<humidity>,L=<lux>>\n" using integer formatting only. */
+void uart_send_sample(int16_t temp_c, uint8_t humidity, uint16_t lux);
+/* Sends "<F>\n". */
+void uart_send_sample_failed(void);
+#endif
+```
+
 ## Makefile
 
 ```makefile
@@ -2318,7 +2422,7 @@ ifneq ($(filter $(STAGE),5 6),)
 SOURCES += hcsr04.c
 endif
 ifeq ($(STAGE),6)
-SOURCES += sample_cycle.c
+SOURCES += sample_cycle.c uart.c
 endif
 OBJECTS := $(SOURCES:%.c=$(BUILD)/%.o)
 OLED_DEBUG_BUILD := .build/oled-debug
@@ -2409,6 +2513,12 @@ extern uint8_t DDRA, DDRB, DDRC, DDRD, PORTA, PORTB, PORTC, PORTD, PINA;
 extern uint8_t TCCR1A, TCCR1B, TCCR0, TCNT0, OCR0, TCCR2, TCNT2;
 extern uint8_t TIFR, TIMSK, SREG, TWSR, TWBR, TWCR, TWDR, ASSR;
 extern uint16_t ICR1, OCR1A, OCR1B;
+extern uint8_t UCSRA, UCSRB, UCSRC, UBRRH, UBRRL;
+/* Host capture: every write to UDR appends one byte; each UDRE wait is counted. */
+extern char uart_tx[512];
+extern unsigned uart_tx_len, uart_udre_waits;
+#define UDR uart_tx[uart_tx_len++ % sizeof uart_tx]
+#define loop_until_bit_is_set(sfr, bit) ((void)(sfr), (void)(bit), uart_udre_waits++)
 #define PA0 0
 #define PA1 1
 #define PA2 2
@@ -2445,6 +2555,12 @@ extern uint16_t ICR1, OCR1A, OCR1B;
 #define TWSTO 4
 #define TWEN 2
 #define TWEA 6
+#define U2X 1
+#define UDRE 5
+#define TXEN 3
+#define URSEL 7
+#define UCSZ1 2
+#define UCSZ0 1
 #endif
 ```
 
@@ -2466,6 +2582,9 @@ uint8_t DDRA, DDRB, DDRC, DDRD, PORTA, PORTB, PORTC, PORTD, PINA;
 uint8_t TCCR1A, TCCR1B, TCCR0, TCNT0, OCR0, TCCR2, TCNT2;
 uint8_t TIFR, TIMSK, SREG, TWSR, TWBR, TWCR, TWDR, ASSR;
 uint16_t ICR1, OCR1A, OCR1B;
+uint8_t UCSRA, UCSRB, UCSRC, UBRRH, UBRRL;
+char uart_tx[512];
+unsigned uart_tx_len, uart_udre_waits;
 ```
 
 ## tests/run_simavr.py
@@ -2595,12 +2714,19 @@ with tempfile.TemporaryDirectory(prefix='sylvan-tests-') as tmp:
         '-o', str(tmp/'i2c_clients')], check=True)
     subprocess.run([str(tmp/'i2c_clients')], check=True)
     subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2',
-        '-I'+str(root), str(root/'tests/test_sample_cycle.c'),
-        str(root/'sample_cycle.c'), '-o', str(tmp/'sample_cycle')], check=True)
+        '-I'+str(root/'tests/fake_avr'), '-I'+str(root), *[str(root/n) for n in
+        ['tests/test_uart.c', 'tests/registers.c', 'uart.c']],
+        '-o', str(tmp/'uart')], check=True)
+    subprocess.run([str(tmp/'uart')], check=True)
+    subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2',
+        '-I'+str(root/'tests/fake_avr'), '-I'+str(root), str(root/'tests/test_sample_cycle.c'),
+        str(root/'sample_cycle.c'), str(root/'uart.c'), str(root/'tests/registers.c'),
+        '-o', str(tmp/'sample_cycle')], check=True)
     subprocess.run([str(tmp/'sample_cycle')], check=True)
     subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2',
-        '-DINTEGRATION_STAGE=6', '-I'+str(root),
+        '-DINTEGRATION_STAGE=6', '-I'+str(root/'tests/fake_avr'), '-I'+str(root),
         str(root/'tests/test_sampling_main.c'), str(root/'sample_cycle.c'),
+        str(root/'uart.c'), str(root/'tests/registers.c'),
         '-o', str(tmp/'sampling_main')], check=True)
     for arguments in [[], ['bad-dht'], ['missing-light']]:
         subprocess.run([str(tmp/'sampling_main'), *arguments], check=True)
@@ -2621,6 +2747,7 @@ print('PASS: both reference source hashes unchanged.')
 #include <simavr/sim_io.h>
 #include <simavr/avr_ioport.h>
 #include <simavr/avr_timer.h>
+#include <simavr/avr_uart.h>
 #include <simavr/sim_cycle_timers.h>
 
 static avr_t *cpu;
@@ -2630,6 +2757,22 @@ static unsigned latest_cm, distance_addr, sweep, readings, worst_error;
 static unsigned dht_reads, dht_phase, bit_index, dht_disabled;
 static uint8_t dht_data[5];
 static uint64_t last_poll, max_poll_gap;
+static char uart_line[64];
+static unsigned uart_len, uart_packets;
+
+/* ESP32-CAM link. BH1750 is absent on this simulated bus, so every sample fails. */
+static void uart_output(avr_irq_t *irq, uint32_t value, void *unused)
+{
+    (void)irq; (void)unused;
+    assert(cpu->data[0x4a]==0 && cpu->data[0x48]==0); /* Motors stopped. */
+    assert(uart_len<sizeof uart_line);
+    uart_line[uart_len++]=(char)value;
+    if(value=='\n') {
+        assert(uart_len==4 && !memcmp(uart_line,"<F>\n",4));
+        uart_packets++;
+        uart_len=0;
+    }
+}
 
 static uint32_t symbol(elf_firmware_t *f, const char *name)
 {
@@ -2744,6 +2887,7 @@ int main(int argc, char **argv)
     avr_ioport_external_t external={.name='A',.mask=0x1e,.value=0x0e};
     avr_ioctl(cpu,AVR_IOCTL_IOPORT_SET_EXTERNAL('A'),&external);
     avr_raise_irq(echo,0);
+    avr_irq_register_notify(avr_io_getirq(cpu,AVR_IOCTL_UART_GETIRQ('0'),UART_IRQ_OUTPUT),uart_output,NULL);
     uint32_t poll_pc=symbol(&firmware,"timer_ticks");
     distance_addr=symbol(&firmware,"distance") & 0xffff;
     uint32_t temp_addr=symbol(&firmware,"temperature") & 0xffff;
@@ -2752,7 +2896,7 @@ int main(int argc, char **argv)
     uint32_t ms_addr=symbol(&firmware,"system_millis") & 0xffff;
     uint32_t phase_addr=symbol(&firmware,"cycle_phase") & 0xffff;
     unsigned drove_before=0, drove_after=0, saw_valid_dht=0, saw_bad_dht=0;
-    unsigned saw_result=0, cycle_stops=0, cycle_resumes=0, previous_phase=0;
+    unsigned saw_result=0, cycle_stops=0, cycle_resumes=0, previous_phase=0, results=0;
     uint32_t old_ms=0;
     while(cpu->cycle<20000000) {
         assert(avr_run(cpu)!=cpu_Crashed);
@@ -2766,6 +2910,7 @@ int main(int argc, char **argv)
         if (phase && cpu->cycle>10000) assert(pwm==0);
         if (phase==1 && previous_phase==0) cycle_stops++;
         if (phase==0 && previous_phase==3) cycle_resumes++;
+        if (phase==2 && previous_phase==1) results++;
         if (phase==3) saw_result=1;
         previous_phase=phase;
         if(!sweep) {
@@ -2789,14 +2934,16 @@ int main(int argc, char **argv)
     assert(max_poll_gap<100);
     assert(readings>40);
     assert(saw_result);
+    /* One packet per sampling result; the run may end while one is in flight. */
+    assert(uart_packets>=1 && (uart_packets==results || uart_packets+1==results));
     if(dht_disabled) assert(saw_bad_dht);
     else assert(saw_valid_dht && dht_reads>=1);
     if(!sweep) {
         assert(drove_before && drove_after && saw_bad_dht && dht_reads>=2);
         assert(cycle_stops==2 && cycle_resumes==2);
     }
-    printf("PASS: %u readings, <=%u cm echo error, max polling gap %llu us; logical clock %u ms.\n",
-        readings,worst_error,(unsigned long long)max_poll_gap,old_ms);
+    printf("PASS: %u readings, <=%u cm echo error, max polling gap %llu us; logical clock %u ms; %u UART packets.\n",
+        readings,worst_error,(unsigned long long)max_poll_gap,old_ms,uart_packets);
     avr_terminate(cpu);
 }
 ```
@@ -3084,6 +3231,8 @@ int main(void)
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#include <avr/io.h>
 #include "config.h"
 #include "hcsr04.h"
 #include "sample_cycle.h"
@@ -3098,19 +3247,37 @@ void line_follow_set_paused(uint8_t hold, uint32_t now)
     else releases++;
 }
 
-static uint32_t finish_sample(uint32_t started, uint8_t success)
+static void expect_tx(const char *text)
 {
+    assert(uart_tx_len == strlen(text) && !memcmp(uart_tx, text, uart_tx_len));
+}
+
+static uint32_t finish_sample(uint32_t started, uint8_t success, int16_t temp_c,
+                              const char *packet)
+{
+    uart_tx_len = 0;
     assert(held && sample_cycle_phase() == SAMPLE_ACQUIRING);
     assert(sample_cycle_needs_dht());
     assert(!sample_cycle_needs_light(started + SAMPLE_LIGHT_SETTLE_MS - 1));
     assert(sample_cycle_needs_light(started + SAMPLE_LIGHT_SETTLE_MS));
-    sample_cycle_dht_done(success);
+    sample_cycle_dht_done(success, temp_c, 66);
     assert(!sample_cycle_needs_dht());
-    sample_cycle_light_done(1);
+    /* Late duplicate reports cannot replace the recorded readings. */
+    sample_cycle_dht_done(1, 99, 99);
+    sample_cycle_update(started + 200);
+    assert(sample_cycle_phase() == SAMPLE_ACQUIRING);
+    assert(uart_tx_len == 0); /* Nothing is sent before the result is known. */
+    sample_cycle_light_done(1, 235);
+    sample_cycle_light_done(1, 999);
     assert(!sample_cycle_needs_light(started + 200));
     uint32_t ready = started + 201;
     sample_cycle_update(ready);
     assert(sample_cycle_phase() == SAMPLE_READINGS && held);
+    expect_tx(packet);
+    /* Exactly one packet, however many loop passes the timed screens take. */
+    for (uint32_t i = 0; i < SAMPLE_READINGS_TIME_MS; i += 7)
+        sample_cycle_update(ready + i);
+    expect_tx(packet);
     sample_cycle_update(ready + SAMPLE_READINGS_TIME_MS - 1);
     assert(sample_cycle_phase() == SAMPLE_READINGS && held);
     uint32_t result = ready + SAMPLE_READINGS_TIME_MS;
@@ -3119,8 +3286,12 @@ static uint32_t finish_sample(uint32_t started, uint8_t success)
     assert(sample_cycle_succeeded() == success);
     sample_cycle_update(result + SAMPLE_RESULT_TIME_MS - 1);
     assert(sample_cycle_phase() == SAMPLE_RESULT && held);
+    for (uint32_t i = 0; i < SAMPLE_RESULT_TIME_MS; i += 7)
+        sample_cycle_update(result + i);
     sample_cycle_update(result + SAMPLE_RESULT_TIME_MS);
     assert(sample_cycle_phase() == SAMPLE_DRIVING && !held);
+    sample_cycle_update(result + SAMPLE_RESULT_TIME_MS + 5000);
+    expect_tx(packet);
     return result + SAMPLE_RESULT_TIME_MS;
 }
 
@@ -3135,11 +3306,15 @@ int main(void)
         assert(sample_cycle_observe(30, start));
         assert(holds == 1);
         assert(!sample_cycle_observe(10, start + 1));
-        uint32_t resumed = finish_sample(start, 1);
+        uint32_t resumed = finish_sample(start, 1, 30, "<S,T=30,H=66,L=235>\n");
         assert(holds == 1 && releases == 1);
         /* Remaining beside the same object must not trap the rover in a loop. */
-        for (unsigned i = 0; i < 10000; i += 80)
+        uart_tx_len = 0;
+        for (unsigned i = 0; i < 10000; i += 80) {
             assert(!sample_cycle_observe(18, resumed + i));
+            sample_cycle_update(resumed + i);
+        }
+        assert(uart_tx_len == 0); /* No UART traffic while driving. */
         resumed += 10000;
         assert(!sample_cycle_observe(36, resumed));
         assert(!sample_cycle_observe(36, resumed + OBJECT_CLEAR_TIME_MS - 1));
@@ -3150,21 +3325,33 @@ int main(void)
         assert(!sample_cycle_observe(HCSR04_INVALID_CM, resumed + OBJECT_CLEAR_TIME_MS));
         start = resumed + OBJECT_CLEAR_TIME_MS + 80;
         assert(sample_cycle_observe(18, start));
-        finish_sample(start, 0);
+        resumed = finish_sample(start, 0, 30, "<F>\n");
         assert(holds == 2 && releases == 2);
+        /* A sub-zero temperature is formatted with its sign. */
+        resumed += 10000;
+        assert(!sample_cycle_observe(HCSR04_INVALID_CM, resumed));
+        assert(!sample_cycle_observe(HCSR04_INVALID_CM, resumed + OBJECT_CLEAR_TIME_MS));
+        start = resumed + OBJECT_CLEAR_TIME_MS + 80;
+        assert(sample_cycle_observe(20, start));
+        finish_sample(start, 1, -5, "<S,T=-5,H=66,L=235>\n");
+        assert(holds == 3 && releases == 3);
     }
     sample_cycle_init();
+    uart_tx_len = 0;
     assert(sample_cycle_observe(18, 0));
-    sample_cycle_dht_done(1);
+    sample_cycle_dht_done(1, 30, 66);
     sample_cycle_update(SAMPLE_ACQUIRE_TIMEOUT_MS - 1);
-    assert(sample_cycle_phase() == SAMPLE_ACQUIRING);
+    assert(sample_cycle_phase() == SAMPLE_ACQUIRING && uart_tx_len == 0);
     sample_cycle_update(SAMPLE_ACQUIRE_TIMEOUT_MS);
     assert(sample_cycle_phase() == SAMPLE_READINGS && !sample_cycle_succeeded());
+    expect_tx("<F>\n"); /* Light timed out: valid DHT alone is still a failure. */
     sample_cycle_update(SAMPLE_ACQUIRE_TIMEOUT_MS + SAMPLE_READINGS_TIME_MS);
     assert(sample_cycle_phase() == SAMPLE_RESULT && held);
     sample_cycle_update(SAMPLE_ACQUIRE_TIMEOUT_MS + SAMPLE_READINGS_TIME_MS + SAMPLE_RESULT_TIME_MS);
     assert(sample_cycle_phase() == SAMPLE_DRIVING && !held);
+    expect_tx("<F>\n");
     puts("PASS: sampling stop, two-second readings/result, automatic resume, same-object suppression, rearm, failure and clock wrap.");
+    puts("PASS: one UART packet per sampling stop: success, negative temperature, failure and timeout.");
 }
 ```
 
@@ -3184,6 +3371,7 @@ static char *utoa(unsigned value, char *buffer, int base)
     sprintf(buffer, "%u", value);
     return buffer;
 }
+#include <avr/io.h>
 #define main rover_main
 #include "../main.c"
 #undef main
@@ -3194,6 +3382,12 @@ static uint8_t held, driving, clock_paused, bad_dht, missing_light;
 static unsigned stops, resumes, dht_reads, light_reads, successes, failures;
 static uint8_t saw_readings, saw_moving, result_seen;
 static char rows[4][22];
+static unsigned tx_at_release;
+
+static const char *expected_packet(void)
+{
+    return bad_dht || missing_light ? "<F>\n" : "<S,T=30,H=66,L=235>\n";
+}
 
 uint32_t timebase_millis(void)
 {
@@ -3208,12 +3402,17 @@ void motor_stop(void) { driving = 0; }
 uint8_t motor_is_driving(void) { return driving; }
 void line_sensor_init(void) {}
 void line_follow_init(uint32_t now) { (void)now; }
-void line_follow_update(uint32_t now) { driving = !held && now >= START_DELAY_MS; }
+void line_follow_update(uint32_t now)
+{
+    driving = !held && now >= START_DELAY_MS;
+    if (!held) assert(uart_tx_len == tx_at_release); /* No UART while line following. */
+}
 void line_follow_set_paused(uint8_t hold, uint32_t now)
 {
     held = hold;
     if (hold) {
         assert(!driving);
+        assert(uart_tx_len == tx_at_release);
         hold_at = now;
         stops++;
         result_seen = 0;
@@ -3222,6 +3421,7 @@ void line_follow_set_paused(uint8_t hold, uint32_t now)
         assert(now - result_at >= SAMPLE_RESULT_TIME_MS - 5);
         release_at = now;
         resumes++;
+        tx_at_release = uart_tx_len;
     }
 }
 void hcsr04_init(void) {}
@@ -3271,6 +3471,10 @@ void oled_service(uint32_t now)
         assert(!strcmp(rows[1], bad_dht ? "T:ERRC" : "T:30C"));
         assert(!strcmp(rows[2], missing_light ? "L:ERRLX" : "L:235LX"));
         assert(!strcmp(rows[3], bad_dht ? "H:ERR%" : "H:66%"));
+        /* The packet was sent once, when the result became known. */
+        const char *packet = expected_packet();
+        assert(uart_tx_len == tx_at_release + strlen(packet));
+        assert(!memcmp(uart_tx + tx_at_release, packet, strlen(packet)));
         saw_readings = 1;
     }
     if (phase == SAMPLE_RESULT && !result_seen) {
@@ -3304,8 +3508,61 @@ int main(int argc, char **argv)
     assert(release_at > 15000 && release_at < 19000);
     assert(successes == ((bad_dht || missing_light) ? 0U : 2U));
     assert(failures == ((bad_dht || missing_light) ? 2U : 0U));
-    printf("PASS: actual main loop completes two objects, %s, fresh samples and resume.\n",
-           bad_dht ? "DHT error" : missing_light ? "missing BH1750" : "success messages");
+    assert(UBRRL == 12 && UCSRB == (1 << TXEN));
+    const char *packet = expected_packet();
+    size_t length = strlen(packet);
+    assert(uart_tx_len == 2 * length && uart_udre_waits == uart_tx_len);
+    assert(!memcmp(uart_tx, packet, length) && !memcmp(uart_tx + length, packet, length));
+    printf("PASS: actual main loop completes two objects, %s, fresh samples and resume; UART sent %s twice.\n",
+           bad_dht ? "DHT error" : missing_light ? "missing BH1750" : "success messages",
+           bad_dht || missing_light ? "<F>" : "<S,T=30,H=66,L=235>");
+}
+```
+
+## tests/test_uart.c
+
+```c
+/* Host checks for uart.c: register setup and exact integer-only packet text. */
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+#include <avr/io.h>
+#include "config.h"
+#include "uart.h"
+
+static void expect(const char *text)
+{
+    assert(uart_tx_len == strlen(text) && !memcmp(uart_tx, text, uart_tx_len));
+    assert(uart_udre_waits == uart_tx_len);
+    uart_tx_len = uart_udre_waits = 0;
+}
+
+int main(void)
+{
+    UCSRA = UCSRB = UCSRC = UBRRH = UBRRL = 0xff;
+    uart_init();
+    assert(UART_BAUD == 9600UL && UBRRH == 0 && UBRRL == 12);
+    assert(UCSRA == (1 << U2X));
+    assert(UCSRB == (1 << TXEN)); /* TX only: no RXEN, no interrupt enables. */
+    assert(UCSRC == ((1 << URSEL) | (1 << UCSZ1) | (1 << UCSZ0)));
+    assert(uart_tx_len == 0);
+
+    uart_send_sample(30, 66, 235);
+    expect("<S,T=30,H=66,L=235>\n");
+    uart_send_sample(-5, 40, 0);
+    expect("<S,T=-5,H=40,L=0>\n");
+    uart_send_sample(0, 0, 10);
+    expect("<S,T=0,H=0,L=10>\n");
+    uart_send_sample(INT16_MIN, 255, UINT16_MAX);
+    expect("<S,T=-32768,H=255,L=65535>\n");
+    uart_send_sample(INT16_MAX, 100, 1000);
+    expect("<S,T=32767,H=100,L=1000>\n");
+    uart_send_sample_failed();
+    expect("<F>\n");
+    uart_putc('x');
+    uart_puts("yz");
+    expect("xyz");
+    puts("PASS: UART 9600 8N1 U2X TX-only setup and exact integer packets.");
 }
 ```
 
@@ -3318,7 +3575,7 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parent.parent
 modules = ['motor', 'line_sensor', 'line_follow', 'sample_cycle', 'timebase', 'twi', 'oled',
-           'bh1750', 'dht11', 'hcsr04']
+           'bh1750', 'dht11', 'hcsr04', 'uart']
 files = ['main.c', 'oled_debug.c', 'config.h']
 for module in modules:
     files.extend([module+'.c', module+'.h'])
