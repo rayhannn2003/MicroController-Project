@@ -7,45 +7,6 @@
 #endif
 
 
-/* Fixed hardware allocation for the modular build. */
-#if F_CPU != 1000000UL
-#error "Project Sylvan timing requires F_CPU = 1000000UL"
-#endif
-#ifndef INTEGRATION_STAGE
-#define INTEGRATION_STAGE 6
-#endif
-#if INTEGRATION_STAGE < 1 || INTEGRATION_STAGE > 6
-#error "INTEGRATION_STAGE must be from 1 to 6"
-#endif
-#define MOTOR_IN1 PB0
-#define MOTOR_IN2 PB1
-#define MOTOR_IN3 PB2
-#define MOTOR_IN4 PB3
-#define MOTOR_ENA PD5
-#define MOTOR_ENB PD4
-#define MOTOR_PWM_TOP 49U
-#define HCSR04_TRIG_PIN PA0
-#define HCSR04_ECHO_PIN PA4
-#define DHT11_PIN PA3
-#define TWI_SCL_PIN PC0
-#define TWI_SDA_PIN PC1
-#define OLED_ADDR 0x3C
-#define BH1750_ADDR 0x23
-#define OBSTACLE_DISTANCE_CM 30U
-#define OBJECT_CLEAR_DISTANCE_CM 35U
-#define OBJECT_CLEAR_TIME_MS 500UL
-#define SAMPLE_ACQUIRE_TIMEOUT_MS 3000UL
-#define SAMPLE_LIGHT_SETTLE_MS 200UL
-#define SAMPLE_READINGS_TIME_MS 2000UL
-#define SAMPLE_RESULT_TIME_MS 2000UL
-#define HCSR04_INTERVAL_MS 80U
-#define HCSR04_TIMEOUT_US 30000UL
-#define DHT11_INTERVAL_MS 2000UL
-#define BH1750_INTERVAL_MS 500UL
-#define DISPLAY_INTERVAL_MS 200UL
-#define PERIPHERAL_RETRY_MS 1000UL
-#define TWI_TIMEOUT_MS 2U
-
 // =====================================================
 // SENSOR CONFIGURATION
 // =====================================================

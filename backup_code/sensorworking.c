@@ -21,21 +21,33 @@
 
    DHT11:
        DATA -> PA3
+
+   UART to ESP32-CAM (9600 8N1, transmit only):
+       PD1/TXD -> 1k -> GPIO14/RX, with 2k from GPIO14 to GND
+       Common GND; PD0/RXD is unused
    ========================================================= */
 
 /* Build this same standalone source for each diagnostic phase.
-   1: scan only; 2: BH1750 + OLED (default); 3: DHT11 + BH1750 + OLED.
-   Scanner confirmed 0x23 and 0x3C, with N:2 E:0.
-   Run phase 3 only after phase 2 responds correctly to changing light.
+   1: scan only; 2: BH1750 + OLED; 3: DHT11 + BH1750 + OLED (default).
+   BH1750 uses 0x23; OLED uses 0x3C. DHT11 stays on PA3.
    See BH1750_DEBUG.md for build/flash commands and screen explanations. */
 #define MODE_SCANNER     1
 #define MODE_BH1750      2
 #define MODE_INTEGRATED  3
 #ifndef APP_MODE
-#define APP_MODE MODE_BH1750
+#define APP_MODE MODE_INTEGRATED
 #endif
 #if APP_MODE < MODE_SCANNER || APP_MODE > MODE_INTEGRATED
 #error "APP_MODE must be 1 (scanner), 2 (BH1750), or 3 (integrated)"
+#endif
+
+/* Set to 1 (or build with -DUART_DEBUG=1) to send BOOT\n once.
+   UART is used only in the integrated mode. */
+#ifndef UART_DEBUG
+#define UART_DEBUG 0
+#endif
+#if UART_DEBUG != 0 && UART_DEBUG != 1
+#error "UART_DEBUG must be 0 or 1"
 #endif
 
 #define OLED_ADDR       0x3C
@@ -53,6 +65,69 @@
 #define DHT_PORT        PORTA
 #define DHT_PIN         PINA
 #define DHT_BIT         PA3
+
+
+/* =========================================================
+   HARDWARE UART (PD1/TXD)
+   ========================================================= */
+
+void uart_init(void)
+{
+    UCSRB = 0;
+    UCSRA = (1 << U2X);
+    /* 1 MHz / (8 * (12 + 1)) = 9615 baud, nominal 9600. */
+    UBRRH = 0;  /* URSEL = 0 selects UBRRH at the shared address. */
+    UBRRL = 12;
+    /* Asynchronous, 8 data bits, no parity, one stop bit. */
+    UCSRC = (1 << URSEL) | (1 << UCSZ1) | (1 << UCSZ0);
+    /* TXEN makes PD1 a UART output. RX and UART interrupts stay disabled. */
+    UCSRB = (1 << TXEN);
+}
+
+
+void uart_send_char(char c)
+{
+    while (!(UCSRA & (1 << UDRE)))
+    {
+        /* Hardware UART runs independently of Timer0 and interrupts. */
+    }
+    UDR = (uint8_t)c;
+}
+
+
+void uart_send_string(const char *str)
+{
+    while (*str)
+        uart_send_char(*str++);
+}
+
+
+void uart_send_uint(uint16_t value)
+{
+    char digits[5];  /* uint16_t needs at most five decimal digits. */
+    uint8_t count = 0;
+
+    do
+    {
+        digits[count++] = '0' + (value % 10);
+        value /= 10;
+    } while (value);
+
+    while (count)
+        uart_send_char(digits[--count]);
+}
+
+
+void send_sensor_packet(uint8_t temperature, uint8_t humidity, uint16_t lux)
+{
+    uart_send_string("<S,T=");
+    uart_send_uint(temperature);
+    uart_send_string(",H=");
+    uart_send_uint(humidity);
+    uart_send_string(",L=");
+    uart_send_uint(lux);
+    uart_send_string(">\n");
+}
 
 
 /* =========================================================
@@ -1241,6 +1316,13 @@ void display_bh_status(uint8_t error, uint8_t page)
 
 int main(void)
 {
+#if APP_MODE == MODE_INTEGRATED
+    uart_init();
+#if UART_DEBUG
+    uart_send_string("BOOT\n");
+#endif
+#endif
+
     twi_init();
     twi_recover();
     oled_init();
@@ -1262,6 +1344,10 @@ int main(void)
 
     while (1)
     {
+#if APP_MODE == MODE_INTEGRATED
+        /* DHT timing completes before any I2C or UART transmission. */
+        uint8_t dht_error = dht11_read(&temperature, &humidity);
+#endif
         uint8_t bh_error = BH_OK;
         if (!bh_ready)
         {
@@ -1291,7 +1377,6 @@ int main(void)
         _delay_ms(1000);
 #else
         /* Complete sensor transactions before drawing the next frame. */
-        uint8_t dht_error = dht11_read(&temperature, &humidity);
         oled_frame();
         oled_cursor(0, 0);
         oled_string("T:");
@@ -1314,7 +1399,14 @@ int main(void)
             display_error(dht_error);
 
         display_light(lux, bh_error, 4);
-        display_bh_status(bh_error, 6);
+        if (bh_error)
+            display_bh_status(bh_error, 6);
+
+        /* Send the same fresh values shown on the OLED. Skip this sample
+           if either sensor failed, even if previous values are retained. */
+        if (dht_error == 0 && bh_error == BH_OK)
+            send_sensor_packet(temperature, humidity, lux);
+
         _delay_ms(2000);
 #endif
     }

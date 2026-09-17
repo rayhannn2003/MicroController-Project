@@ -1,11 +1,40 @@
 The scanner now reports **`0x23` (35) and `0x3C` (60), with `N:2 E:0`**.
-Both expected addresses respond without scanner bus faults. The next step is to
-verify BH1750 measurements.
+Both expected addresses respond without scanner bus faults. The BH1750-only
+test also returned raw `9`, displayed as `7 lx` at address `0x23`.
 
 `car.c` is a complete standalone AVR C source with three build modes. The default
-is now **mode 2, BH1750 + OLED**, using the confirmed BH1750 address `0x23`.
-Use mode 3 only after this test responds to changes in light. There is no
-automatic transition to integration. The scanner remains available as mode 1.
+is now **mode 3, DHT11 + BH1750 + OLED**, using the confirmed BH1750 address
+`0x23`. It preserves the DHT11 timer/read routines from
+`temperatureowrkingcode.c` exactly. The scanner remains available as mode 1,
+and the BH1750-only diagnostic remains available as mode 2.
+
+For the combined firmware, run `make` from the project directory to build
+`car/car.hex`, then `make flash` to program it through USBasp. The normal OLED
+screen shows temperature, humidity, and lux. Address/status details appear on
+the last line when the light sensor reports an error.
+
+The integrated mode also transmits the displayed sensor values to the ESP32-CAM
+over hardware UART on PD1/TXD. Each successful sample sends exactly
+`<S,T=30,H=66,L=235>` followed by a single newline (example values). The sample
+order is DHT11, BH1750, OLED update, UART packet, then a two-second pause. A failed
+DHT11 or BH1750 read suppresses that sample's packet while retaining OLED error
+reporting. No UART receive function or timer is used.
+
+UART uses `U2X=1`, `UBRR=12`, and 9600 8N1; `URSEL` selects UCSRC when setting
+the frame format, and each byte waits for UDRE. These settings follow the
+[ATmega32A USART documentation](https://ww1.microchip.com/downloads/en/devicedoc/atmega32a-datasheet-complete-ds40002072a.pdf),
+section 20. Connect PD1 through 1k to ESP32 GPIO14, with 2k from that junction to
+GND and a common ground, as in the supplied wiring. PD0/RXD is unused.
+
+`UART_DEBUG` defaults to `0`, so only sensor packets are transmitted. Set it to
+`1` in `car.c` to add exactly one `BOOT` line at startup, or compile explicitly:
+
+```sh
+avr-gcc -mmcu=atmega32 -std=gnu11 -Os -Wall -Wextra -Werror -DUART_DEBUG=1 car.c -o car.elf
+avr-objcopy -O ihex -R .eeprom car.elf car.hex
+```
+
+The scanner and BH1750-only modes do not initialize UART or send packets.
 
 The initial likely causes, before the successful scanner result, were:
 
@@ -51,7 +80,7 @@ avr-objcopy -O ihex -R .eeprom i2c_scanner.elf i2c_scanner.hex
 avrdude -c usbasp -p m32 -B 8 -U flash:w:i2c_scanner.hex:i
 ```
 
-`make` now builds the BH1750 diagnostic as `car.hex`. Use the explicit mode 1
+`make` now builds the combined sensor firmware as `car.hex`. Use the explicit mode 1
 command above to rebuild the scanner.
 The scanner probes all addresses `0x08` through `0x77`, stores every ACK, and
 cycles through them with a one-second pause on each screen before rescanning:
@@ -156,8 +185,8 @@ avr-objcopy -O ihex -R .eeprom integrated.elf integrated.hex
 avrdude -c usbasp -p m32 -B 8 -U flash:w:integrated.hex:i
 ```
 
-The screen displays `T:...C`, `H:...%`, `L:... lx`, plus the BH1750 address/status
-on the last line. DHT11 stays on PA3 with its original Timer0 timing code and at
+The screen displays `T:...C`, `H:...%`, and `L:... lx`. The BH1750 address/status
+appears on the last line on light-sensor errors. DHT11 stays on PA3 with its original Timer0 timing code and at
 least two seconds between samples. Each sensor transaction completes before
 OLED drawing starts. DHT errors remain on the T/H rows; light errors use E1-E7
 on the L row. All flash commands write flash only; none changes fuse bits.
