@@ -3,7 +3,6 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
-#include <WebSocketsClient.h>
 #include <time.h>
 
 #include "esp_camera.h"
@@ -22,12 +21,8 @@
 // 4. Join the home Wi-Fi (station mode) and upload each sample to the
 //    server: POST /api/samples (readings in the query string, the JPEG
 //    as the raw body). See uploadSampleToServer() below.
-// 5. Push live video to the deployed dashboard's Live page over a
-//    WebSocket to /ws/device (hello + heartbeat JSON, JPEG frames as
-//    binary), only while someone is actually watching. See the "LIVE
-//    VIEW WEBSOCKET" section below.
-// 6. Local web portal (port 80) + MJPEG live stream (port 81), for
-//    debugging on the same Wi-Fi network — independent of 4 and 5.
+// 5. Local web portal (port 80) + MJPEG live stream (port 81), for
+//    debugging on the same Wi-Fi network — unchanged by the upload code.
 //
 // ATmega packets (9600 baud, 8N1, one per line):
 //   <S,T=30,H=66,L=235>\n   successful sample
@@ -84,8 +79,6 @@ const char *DEVICE_KEY = "989566480edd2d4da74e54793490a4ae5cfd2ef77a79dc255a8e40
 const char *SERVER_HOST = "sylvan.daftar-e.com";
 const uint16_t SERVER_PORT = 443;
 const char *UPLOAD_PATH = "/api/samples";
-const char *DEVICE_WS_PATH = "/ws/device";
-const char *FW_VERSION = "sylvan-esp32cam-1.0";
 
 // ISRG Root X1 — the root certificate that issued the server's Let's Encrypt certificate
 // (valid until 2035-06-04). Used so the ESP32 actually verifies it is talking to the real
@@ -145,17 +138,6 @@ static const char *STREAM_CONTENT_TYPE =
 static const char *STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char *STREAM_PART =
     "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
-
-// ---- Live view over WebSocket, to the deployed dashboard's Live page ----
-WebSocketsClient wsDevice;
-uint16_t liveTargetFps = 5;          // overwritten by the server's `config` message on connect
-uint8_t liveJpegQuality = 65;        // overwritten by the server's `config` message on connect
-volatile int liveViewerCount = 0;    // set by the server's `viewers` message
-bool liveStreamActive = false;       // true once a frame has actually been sent this session
-unsigned long lastLiveHeartbeatAt = 0;
-unsigned long lastLiveFrameAt = 0;
-const unsigned long LIVE_HEARTBEAT_INTERVAL_MS = 5000;   // well under the server's 30s timeout
-const size_t LIVE_MAX_FRAME_BYTES = 190000;              // stay under the server's 200 KB cap
 
 
 // =====================================================
@@ -501,132 +483,6 @@ bool uploadSampleToServer(uint32_t sampleId, bool ok, float t, float h, float l,
     }
 
     return false;
-}
-
-
-// =====================================================
-// LIVE VIEW WEBSOCKET (/ws/device)
-// =====================================================
-//
-// Separate from uploadSampleToServer() above: this is a long-lived connection, not a
-// one-shot request. Protocol (fixed by the server, see server/src/realtime/protocol.ts):
-//   -> {"type":"hello","fw":"...","bootId":"..."}          once, right after connecting
-//   -> {"type":"heartbeat","rssi":...,"uptimeS":...,"freeHeap":...,"streaming":...}
-//                                                           every few seconds, always
-//   <- {"type":"config","targetFps":N,"jpegQuality":N}     once, right after connecting
-//   <- {"type":"viewers","count":N}                        whenever the watcher count changes
-//   -> binary JPEG frames                                  only while count > 0
-//
-// Frames are captured through the same captureJpeg()/cameraMutex used by the sample photo
-// and the local MJPEG stream, so all three can never corrupt each other's frame buffer.
-
-// Very small, fixed-shape JSON from our own server — hand-parsing avoids pulling in a JSON
-// library for two integer fields, matching how the rest of this file builds/reads JSON.
-long jsonIntField(const String &json, const char *key)
-{
-    String needle = String("\"") + key + "\":";
-    int at = json.indexOf(needle);
-    if (at < 0)
-        return -1;
-    return json.substring(at + needle.length()).toInt();
-}
-
-void onWsDeviceEvent(WStype_t type, uint8_t *payload, size_t length)
-{
-    switch (type)
-    {
-        case WStype_CONNECTED:
-        {
-            Serial.println("Live WS: connected to /ws/device");
-            liveStreamActive = false;
-            liveViewerCount = 0;
-            String hello = String("{\"type\":\"hello\",\"fw\":\"") + FW_VERSION +
-                           "\",\"bootId\":\"" + String(bootId) + "\"}";
-            wsDevice.sendTXT(hello);
-            break;
-        }
-
-        case WStype_DISCONNECTED:
-            Serial.println("Live WS: disconnected");
-            liveStreamActive = false;
-            liveViewerCount = 0;
-            break;
-
-        case WStype_TEXT:
-        {
-            String msg(reinterpret_cast<char *>(payload), length);
-
-            if (msg.indexOf("\"type\":\"config\"") >= 0)
-            {
-                long fps = jsonIntField(msg, "targetFps");
-                long quality = jsonIntField(msg, "jpegQuality");
-                if (fps > 0)
-                    liveTargetFps = (uint16_t)fps;
-                if (quality > 0)
-                    liveJpegQuality = (uint8_t)quality;
-                Serial.printf("Live WS: config fps=%u quality=%u\n", liveTargetFps, liveJpegQuality);
-            }
-            else if (msg.indexOf("\"type\":\"viewers\"") >= 0)
-            {
-                long count = jsonIntField(msg, "count");
-                liveViewerCount = count >= 0 ? (int)count : 0;
-                Serial.printf("Live WS: %d viewer(s) watching\n", liveViewerCount);
-            }
-            break;
-        }
-
-        default:
-            break;   // WStype_ERROR/PING/PONG/fragments: nothing to do
-    }
-}
-
-void sendLiveHeartbeatIfDue()
-{
-    if (!wsDevice.isConnected())
-        return;
-
-    unsigned long now = millis();
-    if (now - lastLiveHeartbeatAt < LIVE_HEARTBEAT_INTERVAL_MS)
-        return;
-    lastLiveHeartbeatAt = now;
-
-    String heartbeat = String("{\"type\":\"heartbeat\",\"rssi\":") + String(WiFi.RSSI()) +
-                        ",\"uptimeS\":" + String(now / 1000) +
-                        ",\"freeHeap\":" + String(ESP.getFreeHeap()) +
-                        ",\"streaming\":" + (liveStreamActive ? "true" : "false") + "}";
-    wsDevice.sendTXT(heartbeat);
-}
-
-void sendLiveFrameIfDue()
-{
-    if (!wsDevice.isConnected() || liveViewerCount <= 0 || !cameraReady)
-    {
-        liveStreamActive = false;
-        return;
-    }
-
-    unsigned long now = millis();
-    unsigned long intervalMs = 1000UL / (liveTargetFps > 0 ? liveTargetFps : 1);
-    if (now - lastLiveFrameAt < intervalMs)
-        return;
-
-    uint8_t *jpg = nullptr;
-    size_t jpgLen = 0;
-
-    // waitTicks = 0: never block loop() for this — skip the tick if the camera is busy
-    // with a sample photo or the local MJPEG stream, and try again next time.
-    if (!captureJpeg(liveJpegQuality, &jpg, &jpgLen, 0))
-        return;
-
-    lastLiveFrameAt = now;
-
-    if (jpgLen > 0 && jpgLen <= LIVE_MAX_FRAME_BYTES)
-    {
-        wsDevice.sendBIN(jpg, jpgLen);
-        liveStreamActive = true;
-    }
-
-    free(jpg);
 }
 
 
@@ -1563,19 +1419,6 @@ void setup()
             Serial.printf("Time synced: %s", ctime(&now));
     }
 
-    // ---------- Live view WebSocket (/ws/device) ----------
-    // Configured once, unconditionally: the library's own loop() handles connecting (and
-    // reconnecting) whenever Wi-Fi and NTP time are actually ready, so this stays correct
-    // even if the Wi-Fi connect attempt above hasn't succeeded yet.
-    {
-        String wsHeaders = String("X-Device-Key: ") + DEVICE_KEY;
-        wsDevice.setExtraHeaders(wsHeaders.c_str());
-        wsDevice.onEvent(onWsDeviceEvent);
-        wsDevice.beginSslWithCA(SERVER_HOST, SERVER_PORT, DEVICE_WS_PATH, ROOT_CA_ISRG_X1);
-        wsDevice.setReconnectInterval(5000);
-        Serial.print("Live view: wss://"); Serial.print(SERVER_HOST); Serial.println(DEVICE_WS_PATH);
-    }
-
     // ---------- Live stream server (port 81) ----------
     if (cameraReady)
         streamReady = startStreamServer();
@@ -1600,8 +1443,5 @@ void loop()
 {
     readAtmegaUART();
     server.handleClient();
-    wsDevice.loop();
-    sendLiveHeartbeatIfDue();
-    sendLiveFrameIfDue();
     delay(2);
 }
