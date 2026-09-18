@@ -71,3 +71,13 @@ services:
 
 volumes:
   db-data:
+
+networks:
+  default:
+    # Pinned so the gateway address is stable and can be documented for TRUST_PROXY (see the
+    # README's "Rate limits and IP resolution" section). Docker's default auto-assigned subnet
+    # depends on creation order among every other Compose project on the host, which would make
+    # this address silently change across deployments and break IP-based rate limiting.
+    ipam:
+      config:
+        - subnet: 172.28.90.0/24

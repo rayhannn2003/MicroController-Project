@@ -1,16 +1,22 @@
+import helmet from '@fastify/helmet';
+import rateLimit from '@fastify/rate-limit';
 import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
 import type { Config } from './config.js';
 import type { Sql } from './db/client.js';
 import { AppError, errorBody } from './lib/errors.js';
+import { RATE_LIMITS, rateLimitPluginOptions } from './lib/rateLimits.js';
 import { createRealtime, type Realtime, type RealtimeConfig } from './realtime/index.js';
 import { deviceRoutes } from './routes/device.js';
+import { exploreRoutes } from './routes/explore.js';
 import { healthRoutes } from './routes/health.js';
 import { photoRoutes } from './routes/photos.js';
 import { exportRoutes } from './routes/export.js';
 import { sampleRoutes } from './routes/samples.js';
 import { statsRoutes } from './routes/stats.js';
 import { createDeviceEventStore } from './services/deviceEvents.js';
+import { createDiskUsageReporter } from './services/diskUsage.js';
 import { createEventBus, type EventBus } from './services/events.js';
+import { createExploreService } from './services/explore.js';
 import { createExportService } from './services/export.js';
 import { createPhotoStorage } from './services/photoStorage.js';
 import { createSamplesService } from './services/samples.js';
@@ -24,6 +30,14 @@ export type AppConfig = Pick<
   Partial<Pick<Config, 'displayTimezone' | 'publicBaseUrl'>> & {
     /** Enables the WebSocket channels. Off unless set, so HTTP-only tests are unaffected. */
     realtime?: RealtimeConfig;
+    /**
+     * Enables rate limiting and other production-only hardening (helmet, body limits and
+     * timeouts are always on). Off unless set, so existing tests firing many rapid requests are
+     * unaffected; the real server always turns this on (see index.ts).
+     */
+    hardening?: boolean;
+    /** Test-only override so downsampling can be exercised without inserting thousands of rows. */
+    exploreMaxPoints?: number;
   };
 
 declare module 'fastify' {
@@ -74,10 +88,57 @@ export async function buildApp({
     },
     // Only honour X-Forwarded-* from the local reverse proxy.
     trustProxy: config.trustProxy,
-    bodyLimit: 64 * 1024,
+    // Small: only the JSON/query routes use this. The photo upload route sets its own, larger
+    // bodyLimit (config.maxPhotoBytes) at the route level, overriding this default.
+    bodyLimit: 16 * 1024,
+    // A slow or stalled client should not be able to hold a connection open indefinitely. The CSV
+    // export can legitimately take a few seconds for a large range, so this stays generous.
+    connectionTimeout: 10_000,
+    requestTimeout: 30_000,
     return503OnClosing: true,
     requestIdHeader: false,
   });
+
+  await app.register(helmet, {
+    // The app currently serves only JSON/CSV/photo responses (the SPA is served separately by
+    // nginx in production, or by Vite in development), but the same policy is documented for
+    // nginx to apply to the built frontend too — see README "Security headers".
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        baseUri: ["'self'"],
+        scriptSrc: ["'self'"],
+        // React/Recharts/Radix set inline `style` attributes; there is no inline <style> block
+        // or inline <script>, so this does not weaken script execution protection.
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", 'blob:', 'data:'],
+        fontSrc: ["'self'"],
+        connectSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        frameAncestors: ["'none'"],
+        formAction: ["'self'"],
+        upgradeInsecureRequests: null,
+      },
+    },
+    // TLS is terminated by nginx in production (Phase 5), which is the right place to set HSTS;
+    // the app never knows for certain whether the request it saw arrived over HTTPS.
+    hsts: false,
+    // Matches the CSP's frame-ancestors 'none' above: never embeddable, not even same-origin.
+    frameguard: { action: 'deny' },
+  });
+
+  if (config.hardening) {
+    // Registered as the global default (the public read endpoints), with specific routes
+    // overriding or exempting themselves via their own `config.rateLimit` (see health.ts,
+    // export.ts) or, for the upload route's two-bucket policy, the `app.rateLimit()` decorator
+    // used directly in samples.ts.
+    await app.register(rateLimit, {
+      ...rateLimitPluginOptions,
+      global: true,
+      max: RATE_LIMITS.publicRead.max,
+      timeWindow: RATE_LIMITS.publicRead.timeWindow,
+    });
+  }
 
   const events = createEventBus((error) => {
     app.log.error({ err: error }, 'event handler failed');
@@ -95,10 +156,25 @@ export async function buildApp({
 
   const timezones = createTimezoneResolver(sql, config.displayTimezone ?? 'UTC');
   const stats = createStatsService({ sql, samples, timezones });
+  const explore = createExploreService({
+    sql,
+    timezones,
+    ...(config.exploreMaxPoints !== undefined ? { maxPoints: config.exploreMaxPoints } : {}),
+  });
   const exporter = createExportService({
     sql,
     timezones,
     publicBaseUrl: config.publicBaseUrl ?? '',
+  });
+
+  const disk = createDiskUsageReporter(config.photoDir, {
+    onError: (error) => {
+      app.log.error({ err: error }, 'could not measure photo directory usage');
+    },
+  });
+  disk.start();
+  app.addHook('onClose', () => {
+    disk.stop();
   });
 
   app.setErrorHandler((error: FastifyError | AppError, request, reply) => {
@@ -138,9 +214,18 @@ export async function buildApp({
         app.log.warn({ type }, 'device event rate limit reached; event not recorded');
       },
     });
+    const viewerConnectionLimit = config.hardening
+      ? (config.realtime.maxNewViewerConnectionsPerMinute ?? RATE_LIMITS.viewerConnectionsPerMinute)
+      : config.realtime.maxNewViewerConnectionsPerMinute;
     realtime = createRealtime({
       server: app.server,
-      config: config.realtime,
+      config: {
+        ...config.realtime,
+        trustProxy: config.trustProxy,
+        ...(viewerConnectionLimit !== undefined
+          ? { maxNewViewerConnectionsPerMinute: viewerConnectionLimit }
+          : {}),
+      },
       bus: events,
       events: deviceEvents,
       deviceKey: config.deviceKey,
@@ -159,6 +244,7 @@ export async function buildApp({
   const active = realtime;
   await app.register(healthRoutes, {
     sql,
+    disk,
     ...(active ? { realtimeHealth: () => active.health() } : {}),
   });
   await app.register(sampleRoutes, {
@@ -166,8 +252,10 @@ export async function buildApp({
     events,
     deviceKey: config.deviceKey,
     maxPhotoBytes: config.maxPhotoBytes,
+    hardening: Boolean(config.hardening),
   });
   await app.register(statsRoutes, { stats });
+  await app.register(exploreRoutes, { explore });
   await app.register(exportRoutes, { exporter });
   if (config.servePhotos) {
     await app.register(photoRoutes, { photoDir: storage.root });

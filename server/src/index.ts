@@ -16,9 +16,20 @@ async function main() {
   }
 
   const sql = createSql(config.databaseUrl);
-  const app = await buildApp({ config, sql });
+  const app = await buildApp({ config: { ...config, hardening: true }, sql });
   app.addHook('onClose', async () => {
     await sql.end({ timeout: 5 });
+  });
+
+  // A bug in one request or WebSocket handler must not take the whole server down: on a shared
+  // VPS that would repeatedly drop every other visitor's connection while Docker restarts it.
+  // Individual handlers already catch their own errors (see realtime/deviceChannel.ts and
+  // viewerChannel.ts); this is only the last-resort net for anything that slips through.
+  process.on('uncaughtException', (error) => {
+    app.log.error({ err: error }, 'uncaught exception (continuing)');
+  });
+  process.on('unhandledRejection', (reason) => {
+    app.log.error({ err: reason }, 'unhandled promise rejection (continuing)');
   });
 
   let shuttingDown = false;

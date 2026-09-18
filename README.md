@@ -174,6 +174,31 @@ being built in five phases:
 - `device_events` table recording connect, disconnect, boot and heartbeat-timeout events, so
   "last seen" survives a restart.
 
+## What Phase 4 includes
+
+- **`GET /api/explore`**: analysis-ready data for a range — a downsampled scatter, per-metric
+  histograms, Pearson correlations and an hour-of-day breakdown, all computed in SQL. Powers the
+  **Explore** page (`/explore`): a scatter plot with axis pickers and a plain-language correlation
+  read-out, distribution histograms with a "general indoor-plant guideline" band and the share of
+  samples inside it, and a daily pattern chart.
+- **Rate limiting** (`@fastify/rate-limit`, in-memory, no Redis) on every endpoint, and a cap on
+  new `/ws/live` connections per IP per minute — see "Rate limits" below.
+- **Security headers** (`@fastify/helmet`), including a Content-Security-Policy — see "Security
+  headers" below.
+- **Hardening**: a small (16 KB) global request body limit, request/connection timeouts, and
+  `process.on('uncaughtException'/'unhandledRejection')` as a last-resort safety net so one bad
+  request or WebSocket message cannot take the whole server down.
+- **Disk usage**: `GET /api/health` reports photo storage size and count, and
+  `server/scripts/disk-report.ts` prints a one-off summary. Nothing is ever deleted automatically.
+- **`SECURITY.md`** describes the full trust model: what is public, the one write path, what is
+  intentionally not built (accounts, admin actions, deletion), and why that is fine for this
+  project.
+- **Removed** the Phase 3 remote-capture placeholder entirely (message types, schema, handler, the
+  disabled Live-page button) — see "Later phases" below for why.
+
+`POST /api/samples` (with the device key) is the **only** write path in the whole system; every
+other endpoint is read-only. See `SECURITY.md` for the full reasoning.
+
 ## Local setup
 
 **Prerequisites:** Node.js 22.13+, npm 10+, Docker with Compose v2, `openssl`, `curl`.
@@ -255,6 +280,12 @@ and `DATABASE_URL` are set by `docker-compose.yml`.
 The server checks all of these at startup and exits with a list of the variables that are wrong.
 The list never includes their values.
 
+Rate limits, the CSP, body-size and timeout limits are **not** environment variables: they are
+fixed security policy (see "Rate limits" and "Security headers" below), not per-deployment tuning.
+They are always on when the server starts via `npm start` / `node dist/index.js` (what
+`docker-compose.yml` runs); only the test suite can turn them off, for tests that fire many rapid
+requests in under a second.
+
 ## Running checks
 
 ```bash
@@ -265,6 +296,7 @@ npm run typecheck
 npm run lint
 npm run format       # or format:check
 server/scripts/test-upload.sh   # end-to-end curl demo against a running server
+npm run disk:report             # how much disk photos are using (read-only, never deletes)
 ```
 
 Tests use `TEST_DATABASE_URL` when set. Otherwise they use `DATABASE_URL` with the database renamed
@@ -324,6 +356,7 @@ using the same `X-Upload-Id`. Do not retry `4xx`, because repeating the same req
 | `GET /api/samples/:id` | One `Sample`, or `404 {"error":{"code":"NOT_FOUND",...}}` |
 | `GET /api/samples/:id/neighbors` | `{"previousId": number \| null, "nextId": number \| null}` in time order, or `404` |
 | `GET /api/stats` | Aggregates for a range (see below) |
+| `GET /api/explore` | Analysis-ready data for a range: scatter points, histograms, correlations, hourly pattern (see below) |
 | `GET /api/device` | Current `DeviceStatus` (also pushed over `/ws/live`) |
 | `GET /api/device/events?limit=` | Recent connect/disconnect/boot/timeout events (1–100, default 20) |
 | `GET /api/export.csv` | CSV download of samples (see below) |
@@ -392,6 +425,53 @@ lookups.
 - `latest` is the newest sample in range; `lastUploadAt` is the newest sample overall.
 - `daily` includes days with no samples. Without `from`, it starts at the first sample in range.
   Ranges longer than 366 days return the most recent 366 with `dailyTruncated: true`.
+
+### `GET /api/explore?from&to&tz&bins`
+
+`from`, `to` and `tz` follow the same rules as `/api/stats`. `bins` sets the histogram resolution:
+1–30, default 12. Only successful (`ok=true`) samples are considered; a failed sample has no
+readings to plot. Everything is computed in SQL (`width_bucket`, `corr()`, `extract(hour from …)`),
+never by loading every row into Node.
+
+```json
+{
+  "range": { "from": "2026-09-10T18:00:00.000Z", "to": null, "tz": "Asia/Dhaka" },
+  "count": 62,
+  "points": [
+    { "id": 1, "at": "2026-09-10T20:00:53.927Z", "temperature": 22.5, "humidity": 61.3, "lux": 78 }
+  ],
+  "pointsTruncated": false,
+  "histograms": {
+    "temperature": {
+      "min": 20.5, "max": 30, "binWidth": 1.1875,
+      "bins": [{ "from": 20.5, "to": 21.6875, "count": 16 }]
+    },
+    "humidity": { "min": 50.1, "max": 71.3, "binWidth": 2.65, "bins": ["..."] },
+    "lux": { "min": 19, "max": 8546, "binWidth": 1065.875, "bins": ["..."] }
+  },
+  "correlations": {
+    "temperatureHumidity": -0.377, "temperatureLux": 0.409, "humidityLux": -0.484
+  },
+  "hourly": [
+    { "hour": 0, "count": 3, "avgTemperature": 21.5, "avgHumidity": 64.8, "avgLux": 666 }
+  ]
+}
+```
+
+- `points`: at most 2,001 rows (the 2,000-point cap plus one guaranteed slot for the very last
+  sample, so the plotted range never falls short of the true range), evenly downsampled by row
+  number when there are more. `pointsTruncated` is `true` whenever `count` exceeds the cap.
+- `histograms`: one bin count per metric. Bounds are rounded outward to a display-friendly
+  precision (temperature/humidity to 1 decimal, lux to a whole number) — they cover, and may
+  slightly exceed, the true min/max. When every value in range is identical, the histogram is a
+  single bin of width 0 containing every sample, instead of dividing by zero. An empty range
+  returns `count: 0`, empty `bins`/`points`/`hourly` counts, and every correlation `null` — never
+  an error.
+- `correlations`: Pearson's r, rounded to 3 decimals, `null` when there are fewer than 3 samples
+  or a variable never varies (both make a correlation coefficient meaningless, not just unlucky).
+- `hourly`: always all 24 hours, in the requested timezone, zero-filled where there is no data —
+  the dashboard visually de-emphasizes hours with fewer than 3 samples rather than hiding them.
+- `INVALID_BINS` (bins outside 1–30) joins the usual `INVALID_TIMEZONE`/`INVALID_DATE` errors.
 
 ### `GET /api/export.csv?status&from&to&tz`
 
@@ -522,6 +602,93 @@ viewers count toward the rover's viewer count. Viewers that cannot keep up (more
 `SLOW_VIEWER_BYTES` of unsent data for over 10 seconds) are closed with **4008** so one slow phone
 cannot slow the rover or the other viewers. Frames are never stored on disk or in the database.
 
+## Rate limits
+
+In-memory (`@fastify/rate-limit`; the server already shares this VPS with other sites' own Redis,
+so nothing new is added). A limit response always uses the standard error shape plus a
+`Retry-After` header, and never reveals how many requests remain:
+
+```json
+{ "error": { "code": "RATE_LIMITED", "message": "Too many requests. Please try again shortly." } }
+```
+
+| Endpoint(s) | Limit | Key |
+| --- | --- | --- |
+| `GET /api/samples`, `/api/samples/:id`, `/neighbors`, `/api/stats`, `/api/explore`, `/api/device`, `/api/device/events` | 120 / minute | Client IP |
+| `GET /api/export.csv` | 10 / 5 minutes | Client IP |
+| `POST /api/samples`, valid device key | 60 / minute | SHA-256 hash of the device key (never the IP — the rover is behind NAT) |
+| `POST /api/samples`, missing/wrong key | 20 / minute | Client IP (slows down key-guessing) |
+| New `WS /ws/live` connections | 20 / minute | Client IP |
+| `GET /api/health` | Exempt | — |
+
+**IP resolution.** The app only trusts `X-Forwarded-*` headers from addresses listed in
+`TRUST_PROXY`. Getting this wrong silently breaks every per-IP limit above — if the app's own
+reverse proxy is not trusted, `request.ip` resolves to the proxy's address for every visitor, so
+one visitor could exhaust the whole site's budget for everyone. Locally (`docker compose`), the
+app is reached through Docker's published port, which itself acts like a proxy: every request
+arrives from the Docker bridge network's gateway address, not the real client. `docker-compose.yml`
+pins that network to a fixed subnet for exactly this reason — `172.28.90.0/24`, gateway
+`172.28.90.1` — instead of Docker's default auto-assigned (and therefore unpredictable) subnet.
+**Phase 5 must set:**
+
+```bash
+TRUST_PROXY=127.0.0.1,::1,172.28.90.1
+```
+
+(`127.0.0.1`/`::1` cover nginx connecting directly if it and the app ever share a network
+namespace; `172.28.90.1` covers nginx connecting through the published Docker port, the actual
+Phase 5 setup.) Confirm the address by running `docker network inspect sylvan_default` if the
+subnet in `docker-compose.yml` is ever changed.
+
+**WebSocket connections** bypass Fastify's request handling entirely, so the same IP is resolved
+by hand with `@fastify/proxy-addr` (already a transitive Fastify dependency, added as an explicit
+one here) configured with the same `TRUST_PROXY` list, kept consistent with `request.ip`.
+
+`MAX_VIEWERS` (from Phase 3) still separately caps the *total* number of connected viewers, with a
+`503` before the WebSocket handshake completes; the browser cannot distinguish "full" from a
+generic network failure at that point (browsers deliberately hide the real close reason for a
+failed handshake), so the Live page's message covers both possibilities honestly rather than
+guessing.
+
+## Security headers
+
+Set by `@fastify/helmet` on every response:
+
+```text
+Content-Security-Policy: default-src 'self'; base-uri 'self'; script-src 'self';
+  style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; font-src 'self';
+  connect-src 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+```
+
+(Helmet also adds a few of its own always-safe defaults, such as `script-src-attr 'none'` and
+`Referrer-Policy`, not listed individually above.)
+
+- `style-src 'unsafe-inline'` is needed because React, Recharts and Radix set inline `style`
+  attributes; there is no inline `<style>` block and, importantly, no inline `<script>` — the one
+  inline script from earlier phases (the theme-flash-prevention snippet in `index.html`) was moved
+  to `web/public/theme-init.js` specifically so `script-src` could stay `'self'` with no
+  `'unsafe-inline'` exception.
+- `img-src` allows `blob:` for live camera frames (`URL.createObjectURL`) and `data:` defensively
+  for chart-library internals; nothing in this app uses either for anything else.
+- **`Strict-Transport-Security` is deliberately not set by the app** (`hsts: false`): the app
+  cannot know whether the connection reaching it is genuinely HTTPS (nginx terminates TLS), and
+  sending HSTS from a plain HTTP response would be meaningless at best.
+- Verified by loading the actual production build (`npm run build`, `web/dist`) through a local
+  static server configured with this exact header set: zero Content-Security-Policy violations in
+  the browser console on any page.
+
+**What nginx should set in Phase 5, to avoid duplicating or conflicting with the above:**
+
+- `Strict-Transport-Security` — nginx is the TLS termination point, so it is the only place that
+  can set this correctly.
+- The identical `Content-Security-Policy` (and the other headers above) on the responses that
+  serve `web/dist` (the built frontend), since the Fastify app above never serves that HTML/JS —
+  only nginx does in production. The app's own headers only cover its JSON/CSV/photo responses.
+- Nothing else needs duplicating: `X-Content-Type-Options` and `X-Frame-Options` are harmless to
+  set twice if nginx has a house style that already adds them, but are not required there.
+
 ## Platform folder structure
 
 ```text
@@ -538,12 +705,15 @@ server/
   src/app.ts              builds the Fastify app (logging, trust proxy, error shape, routes)
   src/config.ts           .env loading + Zod validation
   src/db/                 postgres client, migration runner, numbered SQL migrations
-  src/routes/             health, samples (upload, read, neighbors), stats, export, device, photos
+  src/routes/             health, samples (upload, read, neighbors), stats, explore, export,
+                          device, photos
   src/realtime/           device channel, viewer channel, relay, status tracker, protocol
-  src/services/           samples, stats, export (CSV stream), timezones, photoStorage,
-                          events (in-process bus), deviceEvents (connect/boot/timeout log)
-  src/lib/                auth (constant-time key check), validation, csv escaping, errors
-  scripts/                seed.ts, make-fixture.ts, fake-device.ts, test-upload.sh
+  src/services/           samples, stats, explore (histograms/correlations/hourly), export (CSV
+                          stream), diskUsage, timezones, photoStorage, events (in-process bus),
+                          deviceEvents (connect/boot/timeout log)
+  src/lib/                auth (constant-time key check), validation, histogram (nice bounds),
+                          rateLimits (policy + hashing), csv escaping, errors
+  scripts/                seed.ts, make-fixture.ts, fake-device.ts, disk-report.ts, test-upload.sh
   test/                   Vitest suites, test DB setup, fixtures/sample.jpg
 web/                      Phase 2: React dashboard (Vite)
   index.html              shell; applies the saved theme before first paint
@@ -551,28 +721,34 @@ web/                      Phase 2: React dashboard (Vite)
   src/router.tsx          data router; one lazy chunk per page
   src/index.css           design tokens (colors, radii, spacing) for light and dark themes
   src/lib/                api client, query hooks, live updates, WebSocket client, device status
-                          store, URL filters, range presets, formatting, comparisons, chart gap
-                          splitting, constants, theme
+                          store, URL filters, range presets, formatting, comparisons, correlation
+                          bands, chart gap splitting, color blending, constants (incl. comfort
+                          ranges), theme
   src/components/layout/  app shell, top bar, bottom tabs, range sheet, toasts, theme toggle
   src/components/ui/      buttons, cards, badges, photo, readings, relative time, states
   src/components/Lightbox.tsx
-  src/pages/              overview/ (KPIs, charts), gallery, data, live camera, sample detail,
-                          not found
+  src/pages/              overview/ (KPIs, charts), gallery, data, live camera, explore/ (scatter,
+                          histograms, hourly pattern), sample detail, not found
   src/test/               unit and component tests
 deploy/                   Phase 5: nginx + production Compose (placeholder)
 data/photos/              photo storage (git-ignored)
+SECURITY.md               the trust model: what is public, the one write path, what is not built
 ```
 
+**What Phase 4 deliberately does not add, and why:** no authentication, no admin area, and no way
+to write, edit or delete data from the browser — `POST /api/samples` remains the only write path.
+The Phase 3 remote-capture placeholder (`capture`/`capture.result` messages,
+`DeviceChannel.requestCapture()`, the disabled Live-page button) is **removed**, not just left
+disabled, since no admin route will ever exist in this project to call it — see `SECURITY.md`. The
+`/ws/live` upgrade still has no `Origin` check, and still correctly does not need one: Phase 4 adds
+no authentication and no cookies, so there is no session for a malicious page to ride on (the
+classic reason to check `Origin`). That reasoning, not just the absence of a check, is recorded in
+`SECURITY.md` so a future phase re-evaluates it if it ever adds cookie-based auth to anything.
+
 Later phases will add:
-- **Phase 4:** admin routes and hardening (rate limits, security headers). The realtime side is
-  ready for it: `DeviceChannel.requestCapture(requestId)` sends the `capture` command and the
-  device replies with `capture.result`; wire both to an authenticated admin route. Once any
-  endpoint uses cookies, add an `Origin` check to the `/ws/live` upgrade, which is safe to skip
-  today because that channel is public and read-only.
-- **Phase 4:** admin routes and hardening (rate limits, security headers)
-- **Phase 5:** `deploy/` with the nginx site, which serves `data/photos` directly with
-  `SERVE_PHOTOS=false`. Because the Docker port proxy makes requests appear to come from the
-  Compose network gateway, `TRUST_PROXY` must list that address. WebSockets also need:
+- **Phase 5:** `deploy/` with the nginx site, which serves both `web/dist` (the built dashboard)
+  and `data/photos` directly (`SERVE_PHOTOS=false`), and must set `TRUST_PROXY` and the security
+  headers described above. WebSockets also need:
 
   ```nginx
   location /ws/ {

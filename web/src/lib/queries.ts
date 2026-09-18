@@ -20,6 +20,8 @@ export const queryKeys = {
   stats: (params: StatsParams) => [...queryKeys.all, 'stats', params] as const,
   latest: () => [...queryKeys.all, 'latest'] as const,
   device: () => [...queryKeys.all, 'device'] as const,
+  explore: (params: StatsParams & { bins?: number }) =>
+    [...queryKeys.all, 'explore', params] as const,
 };
 
 /**
@@ -93,6 +95,14 @@ export function useDeviceStatus(): { data: DeviceStatus | undefined; isPending: 
   });
   const data = pushed ?? query.data;
   return { data, isPending: data === undefined && query.isPending };
+}
+
+export function useExplore(params: StatsParams & { bins?: number }) {
+  return useQuery({
+    queryKey: queryKeys.explore(params),
+    queryFn: ({ signal }) => api.explore(params, signal),
+    placeholderData: keepPreviousData,
+  });
 }
 
 /** The newest sample overall, polled so the app notices new uploads without a socket. */

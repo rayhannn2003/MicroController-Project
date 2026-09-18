@@ -16,6 +16,8 @@ export default tseslint.config(
       'backup_code/**',
       'Sylvan/**',
       '.kilo/**',
+      // Plain browser script served as a static asset, not part of any tsconfig project.
+      'web/public/**',
     ],
   },
   js.configs.recommended,

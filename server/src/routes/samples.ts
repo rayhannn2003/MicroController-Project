@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { isValidDeviceKey } from '../lib/auth.js';
 import { AppError, errorBody } from '../lib/errors.js';
+import { RATE_LIMITS, hashDeviceKey } from '../lib/rateLimits.js';
 import {
   parseListQuery,
   parseSampleId,
@@ -17,6 +18,8 @@ interface SampleRoutesOptions {
   events: EventBus;
   deviceKey: string;
   maxPhotoBytes: number;
+  /** Off by default so existing fast-firing tests are unaffected; the real server turns it on. */
+  hardening?: boolean;
 }
 
 interface ParsedUpload {
@@ -32,7 +35,7 @@ declare module 'fastify' {
 
 /** `POST /api/samples`, the fixed contract used by the ESP32-CAM firmware. */
 const uploadRoute: FastifyPluginAsync<SampleRoutesOptions> = async (app, options) => {
-  const { samples, events, deviceKey, maxPhotoBytes } = options;
+  const { samples, events, deviceKey, maxPhotoBytes, hardening } = options;
 
   app.decorateRequest('sampleUpload', null);
 
@@ -60,6 +63,29 @@ const uploadRoute: FastifyPluginAsync<SampleRoutesOptions> = async (app, options
       return undefined;
     },
   );
+
+  // Two separate budgets: a valid key is limited by the key itself (never by IP, since the
+  // rover is behind NAT and may share an address with other devices); a wrong or missing key is
+  // limited by IP, to slow down key-guessing without needing to know the key first.
+  const rateLimitGate = hardening
+    ? (() => {
+        const byKey = app.rateLimit({
+          ...RATE_LIMITS.uploadByKey,
+          keyGenerator: (request) => {
+            const key = request.headers['x-device-key'];
+            return typeof key === 'string' ? `upload-key:${hashDeviceKey(key)}` : 'upload-key:none';
+          },
+        });
+        const byIp = app.rateLimit(RATE_LIMITS.uploadFailedAuth);
+        return async (request: FastifyRequest, reply: FastifyReply) => {
+          if (isValidDeviceKey(request.headers['x-device-key'], deviceKey)) {
+            await byKey.call(app, request, reply);
+          } else {
+            await byIp.call(app, request, reply);
+          }
+        };
+      })()
+    : null;
 
   // Auth, query validation and the idempotency lookup run before the body is read, so a
   // rejected or duplicate request never spends time or memory receiving a photo.
@@ -89,7 +115,18 @@ const uploadRoute: FastifyPluginAsync<SampleRoutesOptions> = async (app, options
 
   app.post(
     '/api/samples',
-    { bodyLimit: maxPhotoBytes, onRequest: [authenticate, validate, replayDuplicate] },
+    {
+      bodyLimit: maxPhotoBytes,
+      // The global rate-limit default does not apply here; this route always uses its own
+      // two-bucket policy above (or none at all when hardening is off).
+      config: { rateLimit: false },
+      onRequest: [
+        ...(rateLimitGate ? [rateLimitGate] : []),
+        authenticate,
+        validate,
+        replayDuplicate,
+      ],
+    },
     async (request, reply) => {
       const upload = request.sampleUpload;
       if (!upload) throw new Error('Upload was not validated');

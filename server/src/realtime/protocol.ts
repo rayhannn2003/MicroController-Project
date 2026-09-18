@@ -28,14 +28,6 @@ export const deviceHeartbeatSchema = z.object({
   streaming: z.boolean().optional(),
 });
 
-export const deviceCaptureResultSchema = z.object({
-  type: z.literal('capture.result'),
-  requestId: shortText,
-  ok: z.boolean(),
-  sampleId: z.number().int().positive().optional(),
-  error: z.string().max(200).optional(),
-});
-
 export const viewerWatchSchema = z.object({
   type: z.literal('watch'),
   on: z.boolean(),

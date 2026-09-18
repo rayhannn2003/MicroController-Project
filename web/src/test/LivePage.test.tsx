@@ -181,7 +181,7 @@ describe('LivePage', () => {
     expect(retry).toHaveBeenCalled();
   });
 
-  it('says so when WebSockets are unavailable, and keeps the capture button disabled', () => {
+  it('says so when WebSockets are unavailable, and explains photos still work', () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const socket = new LiveSocket({ url: 'ws://test', WebSocketImpl: null });
     render(
@@ -194,9 +194,9 @@ describe('LivePage', () => {
 
     expect(screen.getByText('Live view needs a WebSocket connection')).toBeInTheDocument();
     expect(screen.getByText(/Samples, photos and charts still work/)).toBeInTheDocument();
-
-    const capture = screen.getByRole('button', { name: 'Capture photo' });
-    expect(capture).toHaveAttribute('aria-disabled', 'true');
-    expect(capture).toHaveAccessibleDescription(/needs admin sign-in/);
+    expect(screen.queryByRole('button', { name: 'Capture photo' })).not.toBeInTheDocument();
+    expect(
+      screen.getByText('Photos are captured automatically each time the rover samples.'),
+    ).toBeInTheDocument();
   });
 });

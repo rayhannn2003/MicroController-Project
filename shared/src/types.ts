@@ -126,6 +126,8 @@ export interface HealthResponse {
   db: 'ok';
   /** Present when the realtime (WebSocket) server is running. */
   ws?: { viewers: number; deviceOnline: boolean };
+  /** Photo storage usage, refreshed periodically (not computed per request). */
+  disk: { photoBytes: number; photoCount: number };
 }
 
 export interface ApiError {
@@ -200,17 +202,7 @@ export interface DeviceHeartbeatMessage {
   streaming?: boolean;
 }
 
-/** Phase 4: reply to a `capture` command. */
-export interface DeviceCaptureResultMessage {
-  type: 'capture.result';
-  requestId: string;
-  ok: boolean;
-  sampleId?: number;
-  error?: string;
-}
-
-export type DeviceMessage =
-  DeviceHelloMessage | DeviceHeartbeatMessage | DeviceCaptureResultMessage;
+export type DeviceMessage = DeviceHelloMessage | DeviceHeartbeatMessage;
 
 // Server → device
 export interface ServerViewersMessage {
@@ -224,14 +216,7 @@ export interface ServerConfigMessage {
   jpegQuality: number;
 }
 
-/** Phase 4: ask the device to take and upload a photo now (admin only). */
-export interface ServerCaptureMessage {
-  type: 'capture';
-  requestId: string;
-}
-
-export type ServerToDeviceMessage =
-  ServerViewersMessage | ServerConfigMessage | ServerCaptureMessage;
+export type ServerToDeviceMessage = ServerViewersMessage | ServerConfigMessage;
 
 // Server → viewer
 export type StreamState = 'starting' | 'live' | 'stopped';
@@ -247,4 +232,61 @@ export type ServerToViewerMessage =
 export interface ViewerWatchMessage {
   type: 'watch';
   on: boolean;
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Explore analytics (Phase 4)
+ * ---------------------------------------------------------------------------------------------- */
+
+export interface ExplorePoint {
+  id: number;
+  at: string;
+  temperature: number;
+  humidity: number;
+  lux: number;
+}
+
+export interface HistogramBin {
+  from: number;
+  to: number;
+  count: number;
+}
+
+export interface Histogram {
+  min: number;
+  max: number;
+  binWidth: number;
+  bins: HistogramBin[];
+}
+
+export interface ExploreCorrelations {
+  /** Pearson r, rounded to 3 decimals; null when count < 3 or a variable is constant. */
+  temperatureHumidity: number | null;
+  temperatureLux: number | null;
+  humidityLux: number | null;
+}
+
+export interface ExploreHourlyBucket {
+  /** 0..23, in the requested timezone. */
+  hour: number;
+  count: number;
+  avgTemperature: number | null;
+  avgHumidity: number | null;
+  avgLux: number | null;
+}
+
+export interface ExploreResponse {
+  range: { from: string | null; to: string | null; tz: string };
+  /** OK samples only; failed samples have no readings. */
+  count: number;
+  points: ExplorePoint[];
+  /** True when `points` was downsampled below `count` (see the API docs for the rule). */
+  pointsTruncated: boolean;
+  histograms: {
+    temperature: Histogram;
+    humidity: Histogram;
+    lux: Histogram;
+  };
+  correlations: ExploreCorrelations;
+  hourly: ExploreHourlyBucket[];
 }

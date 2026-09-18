@@ -65,17 +65,22 @@ export class ViewerChannel {
     });
 
     socket.on('message', (data, isBinary) => {
-      const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
-      const parsed = isBinary ? { kind: 'invalid' as const } : parseTextMessage(buffer);
-      const watch = parsed.kind === 'message' ? viewerWatchSchema.safeParse(parsed.value) : null;
-      if (!watch?.success) {
-        viewer.badMessages++;
-        if (viewer.badMessages > MAX_BAD_MESSAGES) {
-          socket.close(CLOSE.protocolViolation, 'too many invalid messages');
+      // See deviceChannel.ts: one connection's bug must never crash the shared server.
+      try {
+        const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
+        const parsed = isBinary ? { kind: 'invalid' as const } : parseTextMessage(buffer);
+        const watch = parsed.kind === 'message' ? viewerWatchSchema.safeParse(parsed.value) : null;
+        if (!watch?.success) {
+          viewer.badMessages++;
+          if (viewer.badMessages > MAX_BAD_MESSAGES) {
+            socket.close(CLOSE.protocolViolation, 'too many invalid messages');
+          }
+          return;
         }
-        return;
+        this.setWatching(viewer, watch.data.on);
+      } catch (error) {
+        this.options.log.error({ err: error }, 'error handling viewer message');
       }
-      this.setWatching(viewer, watch.data.on);
     });
     socket.on('pong', () => {
       viewer.missedPongs = 0;

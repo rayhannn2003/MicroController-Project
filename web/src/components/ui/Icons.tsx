@@ -177,3 +177,9 @@ export const IconCamera = (p: IconProps) => (
     <circle cx="12" cy="13" r="3.5" />
   </Icon>
 );
+export const IconExplore = (p: IconProps) => (
+  <Icon {...p}>
+    <circle cx="11" cy="11" r="7" />
+    <path d="m20 20-3.6-3.6M11 8v3l2 2" />
+  </Icon>
+);

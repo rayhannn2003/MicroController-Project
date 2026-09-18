@@ -104,6 +104,9 @@ export function useThemeColors() {
       inkMuted: read('--ink-muted'),
       surface: read('--surface'),
       border: read('--border'),
+      brand: read('--brand'),
+      brandSoft: read('--brand-soft'),
+      warnSoft: read('--warn-soft'),
       theme: resolved,
     };
   }, [resolved]);

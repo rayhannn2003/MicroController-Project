@@ -12,7 +12,11 @@ describe('GET /api/health', () => {
     try {
       const res = await ctx.app.inject({ method: 'GET', url: '/api/health' });
       expect(res.statusCode).toBe(200);
-      expect(res.json()).toEqual({ status: 'ok', db: 'ok' });
+      expect(res.json()).toEqual({
+        status: 'ok',
+        db: 'ok',
+        disk: { photoBytes: 0, photoCount: 0 },
+      });
     } finally {
       await ctx.close();
     }

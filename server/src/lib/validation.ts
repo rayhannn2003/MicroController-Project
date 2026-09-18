@@ -221,6 +221,25 @@ export function parseStatsQuery(query: Query): StatsQuery {
   return { tz: parseTimezoneParam(query), ...parseRange(query) };
 }
 
+const BINS = /^\d{1,2}$/;
+
+export interface ExploreQuery extends DateRange {
+  tz: string | null;
+  bins: number;
+}
+
+export function parseExploreQuery(query: Query): ExploreQuery {
+  let bins = 12;
+  if (query.bins !== undefined) {
+    if (typeof query.bins !== 'string' || !BINS.test(query.bins)) {
+      invalid('INVALID_BINS', 'bins must be a whole number between 1 and 30');
+    }
+    bins = Number(query.bins);
+    if (bins < 1 || bins > 30) invalid('INVALID_BINS', 'bins must be between 1 and 30');
+  }
+  return { tz: parseTimezoneParam(query), bins, ...parseRange(query) };
+}
+
 /** Parses a sample id path parameter; returns null when it cannot be a valid id. */
 export function parseSampleId(raw: string): string | null {
   return ID.test(raw) && Number(raw) <= Number.MAX_SAFE_INTEGER ? raw : null;

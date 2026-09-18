@@ -31,6 +31,7 @@ export function EmptyState({
 export function errorMessage(error: unknown): string {
   if (error instanceof ApiError) {
     if (error.code === 'NETWORK_ERROR') return error.message;
+    if (error.status === 429) return 'Too many requests right now. Please try again shortly.';
     if (error.status >= 500) return 'The server had a problem loading this data.';
     return error.message;
   }

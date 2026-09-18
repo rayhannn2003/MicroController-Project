@@ -21,6 +21,7 @@
     "db:up": "docker compose -f docker-compose.yml -f docker-compose.db-port.yml up -d db",
     "db:migrate": "npm run db:migrate -w server",
     "db:seed": "npm run db:seed -w server",
+    "disk:report": "npm run disk:report -w server",
     "test": "npm run build -w shared && npm test -w server && npm test -w web",
     "test:server": "npm run build -w shared && npm test -w server",
     "test:web": "npm run build -w shared && npm test -w web",

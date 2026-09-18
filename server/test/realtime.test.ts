@@ -82,6 +82,18 @@ describe('WS /ws/device authentication', () => {
     await ctx.viewer();
     expect(await upgradeStatus(`${ctx.wsUrl}/ws/live`)).toBe(503);
   });
+
+  it('caps new /ws/live connections per IP per minute, independent of MAX_VIEWERS', async () => {
+    await context({ realtime: { maxViewers: 50, maxNewViewerConnectionsPerMinute: 2 } });
+    await ctx.viewer();
+    await ctx.viewer();
+    expect(await upgradeStatus(`${ctx.wsUrl}/ws/live`)).toBe(429);
+  });
+
+  it('does not cap connections when the limit is left unset (the default in every other test)', async () => {
+    await context({ realtime: { maxViewers: 50 } });
+    for (let i = 0; i < 5; i++) await ctx.viewer();
+  });
 });
 
 describe('device connection lifecycle', () => {
@@ -389,7 +401,12 @@ describe('HTTP endpoints', () => {
     await sleep(80);
 
     const res = await ctx.app.inject({ method: 'GET', url: '/api/health' });
-    expect(res.json()).toEqual({ status: 'ok', db: 'ok', ws: { viewers: 1, deviceOnline: true } });
+    expect(res.json()).toEqual({
+      status: 'ok',
+      db: 'ok',
+      disk: { photoBytes: 0, photoCount: 0 },
+      ws: { viewers: 1, deviceOnline: true },
+    });
   });
 
   it('validates the device events limit', async () => {

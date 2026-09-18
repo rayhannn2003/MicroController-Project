@@ -2,7 +2,7 @@ import type { StreamState, StreamStopReason } from '@sylvan/shared';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
-import { IconCamera, IconLive, IconPlugOff, IconRefresh } from '../components/ui/Icons';
+import { IconLive, IconPlugOff, IconRefresh } from '../components/ui/Icons';
 import { formatNumber } from '../lib/format';
 import { useDeviceStatus } from '../lib/queries';
 import { useLiveSocket, useSocketSnapshot } from '../lib/socketContext';
@@ -134,11 +134,18 @@ export default function LivePage() {
   const hasImage = frame !== null;
 
   let overlay: { title: string; message: string; action?: 'retry' } | null = null;
-  if (unavailable) {
+  if (socketStatus === 'unsupported') {
     overlay = {
       title: 'Live view needs a WebSocket connection',
       message:
-        'This browser or network seems to block WebSockets. Samples, photos and charts still work; they refresh every 15 seconds.',
+        'This browser does not support WebSockets. Samples, photos and charts still work; they refresh every 15 seconds.',
+    };
+  } else if (blocked) {
+    overlay = {
+      title: 'Could not connect to the live stream',
+      message:
+        'This may be a network restriction, or the live view may be full right now. Samples, photos and charts still work; they refresh every 15 seconds.',
+      action: 'retry',
     };
   } else if (tooSlow && !hasImage) {
     overlay = {
@@ -169,23 +176,11 @@ export default function LivePage() {
   return (
     <>
       <title>Live · Sylvan</title>
-      <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">Live camera</h1>
-          <p className="mt-1 text-sm text-ink-muted">
-            Streamed from the rover while someone is watching this page.
-          </p>
-        </div>
-        <Button
-          aria-disabled="true"
-          aria-describedby="capture-help"
-          onClick={(event) => {
-            event.preventDefault();
-          }}
-        >
-          <IconCamera size={16} />
-          Capture photo
-        </Button>
+      <div className="mb-6">
+        <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">Live camera</h1>
+        <p className="mt-1 text-sm text-ink-muted">
+          Streamed from the rover while someone is watching this page.
+        </p>
       </div>
 
       <Card className="overflow-hidden">
@@ -263,9 +258,8 @@ export default function LivePage() {
         </dl>
       </Card>
 
-      <p id="capture-help" className="mt-4 text-sm text-ink-muted">
-        Capturing a photo on demand needs admin sign-in, which arrives in a later phase. The rover
-        keeps taking samples on its own in the meantime.
+      <p className="mt-4 text-sm text-ink-muted">
+        Photos are captured automatically each time the rover samples.
       </p>
     </>
   );

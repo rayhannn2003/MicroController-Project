@@ -6,7 +6,6 @@ import type { DeviceStatusTracker } from './deviceStatus.js';
 import {
   CLOSE,
   MAX_BAD_MESSAGES,
-  deviceCaptureResultSchema,
   deviceHeartbeatSchema,
   deviceHelloSchema,
   isJpegFrame,
@@ -74,7 +73,13 @@ export class DeviceChannel {
     this.options.onConnected();
 
     socket.on('message', (data, isBinary) => {
-      this.handleMessage(connection, toBuffer(data), isBinary);
+      // A bug here must never crash the process: one misbehaving connection would take down
+      // every other device and viewer on a shared server.
+      try {
+        this.handleMessage(connection, toBuffer(data), isBinary);
+      } catch (error) {
+        log.error({ err: error }, 'error handling device message');
+      }
     });
     socket.on('pong', () => {
       connection.missedPongs = 0;
@@ -156,19 +161,6 @@ export class DeviceChannel {
         status.heartbeat(heartbeat.data);
         return;
       }
-      case 'capture.result': {
-        // Phase 4: resolve the pending admin capture request. Nothing can send `capture` yet.
-        const result = deviceCaptureResultSchema.safeParse(parsed.value);
-        if (!result.success) {
-          this.violation(connection, 'invalid capture.result');
-          return;
-        }
-        log.info(
-          { requestId: result.data.requestId, ok: result.data.ok },
-          'capture result (ignored until Phase 4)',
-        );
-        return;
-      }
       default:
         log.debug({ type: parsed.type }, 'ignoring unknown device message type');
     }
@@ -179,14 +171,6 @@ export class DeviceChannel {
     if (socket?.readyState !== 1) return false;
     socket.send(JSON.stringify(message));
     return true;
-  }
-
-  /**
-   * Phase 4: sends a capture command. Deliberately not wired to any route; the admin API must
-   * authenticate before calling this.
-   */
-  requestCapture(requestId: string): boolean {
-    return this.send({ type: 'capture', requestId });
   }
 
   /** Pings the device; terminates it after two unanswered pings. */

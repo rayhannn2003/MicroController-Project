@@ -12,9 +12,13 @@
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed": "tsx scripts/seed.ts",
     "fixtures": "tsx scripts/make-fixture.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "disk:report": "tsx scripts/disk-report.ts"
   },
   "dependencies": {
+    "@fastify/helmet": "^13.1.1",
+    "@fastify/proxy-addr": "^5.1.1",
+    "@fastify/rate-limit": "^11.2.0",
     "@fastify/static": "^10.1.4",
     "fastify": "^5.12.5",
     "postgres": "^3.4.9",

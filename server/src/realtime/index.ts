@@ -2,6 +2,7 @@ import type { IncomingMessage, Server } from 'node:http';
 import { STATUS_CODES } from 'node:http';
 import type { Duplex } from 'node:stream';
 import type { DeviceStatus, StreamState, StreamStopReason } from '@sylvan/shared';
+import proxyAddr from '@fastify/proxy-addr';
 import type { FastifyBaseLogger } from 'fastify';
 import { WebSocketServer } from 'ws';
 import { isValidDeviceKey } from '../lib/auth.js';
@@ -22,6 +23,11 @@ export interface RealtimeConfig {
   jpegQuality: number;
   maxViewers: number;
   maxMessageBytes: number;
+  /** New /ws/live connections allowed per IP per minute. Undefined means unlimited. */
+  maxNewViewerConnectionsPerMinute?: number;
+  /** Trusted proxy list, in the same format as Fastify's `trustProxy`, used to resolve the real
+   *  client IP for the connections-per-minute limiter (WebSocket upgrades bypass `request.ip`). */
+  trustProxy?: string[];
   /** Timing overrides, mainly for tests. */
   tickMs?: number;
   pingIntervalMs?: number;
@@ -44,14 +50,54 @@ export interface Realtime {
   readonly device: DeviceChannel;
 }
 
-function rejectUpgrade(socket: Duplex, status: number, code: string, message: string) {
+function rejectUpgrade(
+  socket: Duplex,
+  status: number,
+  code: string,
+  message: string,
+  retryAfterS?: number,
+) {
   const body = JSON.stringify(errorBody(code, message));
   socket.end(
     `HTTP/1.1 ${status} ${STATUS_CODES[status] ?? ''}\r\n` +
       'Connection: close\r\n' +
       'Content-Type: application/json\r\n' +
+      (retryAfterS !== undefined ? `Retry-After: ${String(retryAfterS)}\r\n` : '') +
       `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
   );
+}
+
+const CONNECTION_WINDOW_MS = 60_000;
+
+/** Fixed-window "N new connections per IP per minute" counter for the /ws/live upgrade path. */
+class ConnectionRateLimiter {
+  private readonly windows = new Map<string, { count: number; windowStart: number }>();
+
+  constructor(
+    private readonly max: number,
+    private readonly now: () => number,
+  ) {}
+
+  /** Returns true and counts the attempt when it is allowed. */
+  tryConsume(key: string): boolean {
+    const now = this.now();
+    const entry = this.windows.get(key);
+    if (!entry || now - entry.windowStart >= CONNECTION_WINDOW_MS) {
+      this.windows.set(key, { count: 1, windowStart: now });
+      return true;
+    }
+    if (entry.count >= this.max) return false;
+    entry.count += 1;
+    return true;
+  }
+
+  /** Drops windows that have already expired, so the map does not grow without bound. */
+  sweep() {
+    const now = this.now();
+    for (const [key, entry] of this.windows) {
+      if (now - entry.windowStart >= CONNECTION_WINDOW_MS) this.windows.delete(key);
+    }
+  }
 }
 
 export function createRealtime(deps: {
@@ -175,6 +221,11 @@ export function createRealtime(deps: {
     viewers.broadcast(event);
   });
 
+  const connectionLimiter = config.maxNewViewerConnectionsPerMinute
+    ? new ConnectionRateLimiter(config.maxNewViewerConnectionsPerMinute, now)
+    : null;
+  const trustProxyFn = proxyAddr.compile(config.trustProxy ?? ['127.0.0.1', '::1']);
+
   // Separate servers so each channel has its own message size limit. JPEGs are already
   // compressed, so per-message deflate would only cost CPU.
   const deviceServer = new WebSocketServer({
@@ -217,6 +268,19 @@ export function createRealtime(deps: {
         rejectUpgrade(socket, 503, 'TOO_MANY_VIEWERS', 'Live view is full; try again later');
         return;
       }
+      if (connectionLimiter) {
+        const ip = proxyAddr(request, trustProxyFn);
+        if (!connectionLimiter.tryConsume(ip)) {
+          rejectUpgrade(
+            socket,
+            429,
+            'RATE_LIMITED',
+            'Too many connection attempts. Please try again shortly.',
+            60,
+          );
+          return;
+        }
+      }
       viewerServer.handleUpgrade(request, socket, head, (ws) => {
         viewers.handleConnection(ws);
       });
@@ -241,6 +305,7 @@ export function createRealtime(deps: {
     }
     flushStatus();
     relay.tick();
+    connectionLimiter?.sweep();
     const current = now();
     if (current - lastPingAt >= pingIntervalMs) {
       lastPingAt = current;
