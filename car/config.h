@@ -83,7 +83,7 @@
  * Increase -> faster but more overshoot.
  * Decrease -> easier to follow curves.
  */
-#define BASE_SPEED_PERCENT       80U
+#define BASE_SPEED_PERCENT       100U
 
 
 /*

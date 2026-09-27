@@ -243,21 +243,10 @@ static void update_display(uint32_t now)
             oled_set_line(2, "Please wait");
             oled_set_line(3, "Car is stopped");
         } else if (phase == SAMPLE_RESULT) {
-            /* 21 columns: "Random Object detected" needs two lines. */
-            uint8_t verdict = sample_cycle_classification();
-            if (verdict == 'T') {
-                oled_set_line(0, "Tree detected");
-                oled_set_line(1, "");
-            } else if (verdict == 'O') {
-                oled_set_line(0, "Random Object");
-                oled_set_line(1, "detected");
-            } else if (verdict == 'U') {
-                oled_set_line(0, "Unclear photo");
-                oled_set_line(1, "");
-            } else {
-                oled_set_line(0, "No result");
-                oled_set_line(1, "Check WiFi/API");
-            }
+            /* Classification is disabled for now: show the sample pipeline outcome
+             * instead of an AI verdict. See ENABLE_OPENAI_CLASSIFY in the ESP32 firmware. */
+            oled_set_line(0, "Sample collected");
+            oled_set_line(1, "Sent to portal");
             oled_set_line(2, sample_cycle_succeeded() ? "Sensors OK" : "Sensor failed");
             oled_set_line(3, "Car is stopped");
         } else {

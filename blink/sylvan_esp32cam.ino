@@ -277,6 +277,8 @@ struct ClassifyResult
 };
 
 // A sample upload running in its own task while the OpenAI call runs in the sample task.
+// The upload task owns this job outright once started and frees it when done, so a slow
+// or hanging server connection never blocks sampleTask from picking up the next sample.
 struct UploadJob
 {
     String uploadId;
@@ -285,14 +287,17 @@ struct UploadJob
     char reason[48];
     uint8_t *jpg;       // this job's own copy of the photo
     size_t jpgLen;
-    volatile bool success;
-    SemaphoreHandle_t done;
-    int refs;           // freed by whichever of the two tasks lets go last
+    ClassifyResult verdict;
 };
 
 // Set to false to upload after classification instead of at the same time (uses less memory:
 // only one extra TLS connection at a time).
 const bool PARALLEL_UPLOAD = true;
+
+// TEMP DEBUG: set to true to re-enable OpenAI classification. While false, classifyPhoto()
+// returns immediately with no network call, so samples (sensors + photo) still reach the
+// website normally, just without a verdict.
+const bool ENABLE_OPENAI_CLASSIFY = false;
 
 uint32_t nextSampleId = 1;
 uint32_t sampleCount = 0;     // successful samples
@@ -965,6 +970,14 @@ ClassifyResult classifyPhoto(const uint8_t *jpg, size_t jpgLen)
 {
     ClassifyResult result = {'E', ""};
 
+    if (!ENABLE_OPENAI_CLASSIFY)
+    {
+        result.code = 'U';
+        strlcpy(result.note, "OpenAI disabled (debug)", sizeof(result.note));
+        LOGI("OpenAI: skipped, classification disabled for debugging");
+        return result;
+    }
+
     if (jpg == nullptr || jpgLen == 0)
     {
         strlcpy(result.note, "no photo to classify", sizeof(result.note));
@@ -1155,22 +1168,24 @@ bool postClassification(const String &uploadId, const ClassifyResult &verdict)
 // loop() keeps running throughout, so the live view and heartbeats never stall.
 
 
-void releaseUpload(UploadJob *job)
+void freeUpload(UploadJob *job)
 {
-    if (__atomic_sub_fetch(&job->refs, 1, __ATOMIC_ACQ_REL) != 0)
-        return;
     free(job->jpg);
-    vSemaphoreDelete(job->done);
     delete job;
 }
 
 void uploadTask(void *arg)
 {
     UploadJob *job = (UploadJob *)arg;
-    job->success = uploadSampleToServer(job->uploadId, job->ok, job->t, job->h, job->l,
+    bool success = uploadSampleToServer(job->uploadId, job->ok, job->t, job->h, job->l,
                                         job->reason, job->jpg, job->jpgLen);
-    xSemaphoreGive(job->done);
-    releaseUpload(job);
+    if (success)
+        postClassification(job->uploadId, job->verdict);
+    else
+        LOGW("sample %s: verdict not sent to server because the upload failed",
+             job->uploadId.c_str());
+    LOGI("sample %s: upload finished (%s)", job->uploadId.c_str(), success ? "ok" : "FAILED");
+    freeUpload(job);
     vTaskDelete(nullptr);
 }
 
@@ -1212,7 +1227,7 @@ void processSample(const SampleJob &job)
     else
         LOGW("sample #%lu: photo capture FAILED", (unsigned long)job.id);
 
-    // Start the upload first so it overlaps the OpenAI call.
+    // Build the upload job now, but don't start it until the verdict is attached below.
     UploadJob *upload = new UploadJob();
     upload->uploadId = uploadId;
     upload->ok = job.ok;
@@ -1220,8 +1235,6 @@ void processSample(const SampleJob &job)
     upload->h = job.h;
     upload->l = job.l;
     strlcpy(upload->reason, job.reason, sizeof(upload->reason));
-    upload->done = xSemaphoreCreateBinary();
-    upload->refs = 2;
     if (jpg != nullptr)
     {
         upload->jpg = (uint8_t *)largeAlloc(jpgLen);
@@ -1235,41 +1248,36 @@ void processSample(const SampleJob &job)
                  (unsigned long)job.id);
     }
 
-    bool parallel = PARALLEL_UPLOAD && upload->done != nullptr &&
-                    xTaskCreatePinnedToCore(uploadTask, "upload", 12288, upload, 1, nullptr, 0) ==
-                        pdPASS;
-    if (PARALLEL_UPLOAD && !parallel)
-        LOGW("could not start the upload task; uploading after classification instead");
-
     ClassifyResult verdict = classifyPhoto(jpg, jpgLen);
     sendClassificationToAtmega(verdict.code);
+    upload->verdict = verdict;
 
-    bool uploaded = false;
+    // Hand the job off to its own task so a slow or hanging server connection only delays
+    // this sample's own upload, never the next sample waiting behind it in sampleQueue.
+    bool parallel = PARALLEL_UPLOAD &&
+                    xTaskCreatePinnedToCore(uploadTask, "upload", 12288, upload, 1, nullptr, 0) ==
+                        pdPASS;
     if (parallel)
     {
-        if (xSemaphoreTake(upload->done, pdMS_TO_TICKS(90000)) == pdTRUE)
-            uploaded = upload->success;
-        else
-            LOGE("sample #%lu: upload still running after 90 s", (unsigned long)job.id);
-        releaseUpload(upload);
+        // uploadTask now owns `upload` and frees it when the upload completes.
     }
     else
     {
-        uploaded = uploadSampleToServer(uploadId, job.ok, job.t, job.h, job.l, job.reason,
-                                        upload->jpg, upload->jpgLen);
-        upload->refs = 1;
-        releaseUpload(upload);
+        if (PARALLEL_UPLOAD)
+            LOGW("could not start the upload task; uploading here instead");
+        bool uploaded = uploadSampleToServer(uploadId, job.ok, job.t, job.h, job.l, job.reason,
+                                             upload->jpg, upload->jpgLen);
+        if (uploaded)
+            postClassification(uploadId, verdict);
+        else
+            LOGW("sample #%lu: verdict not sent to server because the upload failed",
+                 (unsigned long)job.id);
+        freeUpload(upload);
     }
 
-    if (uploaded)
-        postClassification(uploadId, verdict);
-    else
-        LOGW("sample #%lu: verdict not sent to server because the upload failed",
-             (unsigned long)job.id);
-
     storeHistory(job, jpg, jpgLen, verdict.code);
-    LOGI("sample #%lu done in %lu ms (verdict %s, upload %s)", (unsigned long)job.id,
-         millis() - startedAt, labelFor(verdict.code), uploaded ? "ok" : "FAILED");
+    LOGI("sample #%lu done in %lu ms (verdict %s)", (unsigned long)job.id,
+         millis() - startedAt, labelFor(verdict.code));
 }
 
 void sampleTask(void *)

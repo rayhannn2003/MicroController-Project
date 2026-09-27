@@ -80,8 +80,11 @@ static void log_verdict(uint8_t verdict)
 
 void sample_cycle_update(uint32_t now)
 {
+    /* Classification is disabled for now: a verdict that arrives while we're still
+     * showing the reading is logged, but nothing waits on it (see the READINGS ->
+     * RESULT transition below, which no longer goes through SAMPLE_CLASSIFYING). */
     uint8_t reply = uart_take_classification();
-    if (reply && (cycle_phase == SAMPLE_READINGS || cycle_phase == SAMPLE_CLASSIFYING)) {
+    if (reply && cycle_phase == SAMPLE_READINGS) {
         classification = reply;
         log_verdict(reply);
     } else if (reply) {
@@ -110,12 +113,8 @@ void sample_cycle_update(uint32_t now)
         phase_started = now;
     } else if (cycle_phase == SAMPLE_READINGS &&
                (uint32_t)(now - phase_started) >= SAMPLE_READINGS_TIME_MS) {
-        cycle_phase = SAMPLE_CLASSIFYING;
-        phase_started = now;
-    } else if (cycle_phase == SAMPLE_CLASSIFYING &&
-               (classification ||
-                (uint32_t)(now - phase_started) >= CLASSIFY_TIMEOUT_MS)) {
-        if (!classification) log_verdict(0);
+        /* Classification disabled for now: skip straight past SAMPLE_CLASSIFYING
+         * instead of waiting up to CLASSIFY_TIMEOUT_MS for an ESP32 verdict. */
         cycle_phase = SAMPLE_RESULT;
         phase_started = now;
     } else if (cycle_phase == SAMPLE_RESULT &&
